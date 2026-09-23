@@ -1,1 +1,2 @@
-# Python 3.14.7 standard library only.
+# phasecut 仅使用 Python 3.14.7 标准库（math / collections / typing）。
+# 无需安装任何第三方依赖，本文件故意留空（无 pip 包）。
