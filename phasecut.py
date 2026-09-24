@@ -1,6 +1,6 @@
 """phasecut — 二维包裹相位的残差切口（branch cut）展开模块。
 
-只依赖 Python 3.14 标准库。核心流程：
+只依赖 Python 3.14 标准库。单帧空间流程：
 
 1. 对每个四点全有效的 2×2 环路，用包裹到 [-pi, pi) 的邻差求和，
    四舍五入到最近整数得到整数残差电荷（典型为 -1/0/+1）。
@@ -11,6 +11,10 @@
 4. 每个切口连通区从字典序最小像素起洪凡展开，锚点整数偏移基准为 0。
 5. 对所有非切口有效边做一致性复核，矛盾以 unmet_edges 如实输出，
    不用平滑结果掩盖。
+
+相邻两帧（align_frames）：两帧各自独立完成上述空间展开后，取共同有效
+像素，选一个全局整数周 k 最小化 Σ(phi_a-(phi_b+2πk))²；凸二次只需比较
+floor(mean(d)/2π) 与 +1，并列取较小整数；无共同像素返回未对齐状态。
 
 接口与错误语义见模块 README。
 """
@@ -32,6 +36,7 @@ __all__ = [
     "UnmetEdge",
     "Region",
     "UnwrapResult",
+    "FrameAlignment",
     "PhaseCutError",
     "InvalidPhaseInputError",
     "SearchBudgetExhausted",
@@ -39,6 +44,7 @@ __all__ = [
     "UnwrappingContradictionError",
     "wrap_phase",
     "unwrap_phase",
+    "align_frames",
 ]
 
 MAX_SIZE = 32
@@ -115,9 +121,31 @@ class UnwrapResult(NamedTuple):
     residues: tuple[Residue, ...]
     cuts: tuple[CutEdge, ...]
     regions: tuple[Region, ...]
-    #: 与输入同形的展开相位；无效像素位置为 None。
+    #: 与输入同形的展开相位；无效像素为 None。
     unwrapped: tuple[tuple[Optional[float], ...], ...]
     unmet_edges: tuple[UnmetEdge, ...]
+
+
+class FrameAlignment(NamedTuple):
+    """相邻两帧各自空间展开后的全局整数周对齐结果。
+
+    frame_a / frame_b：两帧各自的 UnwrapResult（旧空间展开，逐帧独立）。
+    aligned：两帧是否存在共同有效像素（False 时其余对齐字段为 None；
+             两帧的展开结果与掩码仍完整保留）。
+    shift：全局整数周偏移 k，使 frame_b 对齐到 frame_a：
+           phi_b_aligned = phi_b + 2π·k，在共同有效像素上平方差最小；
+           并列（平方差相等）时取较小整数。
+    shared_pixels：共同有效像素坐标，按字典序排列；无共同像素时为 ()。
+    squared_error：对齐后共同像素上的 Σ(phi_a - (phi_b + 2π·k))²（rad²）；
+                   无共同像素时为 None。
+    """
+
+    frame_a: UnwrapResult
+    frame_b: UnwrapResult
+    aligned: bool
+    shift: Optional[int]
+    shared_pixels: tuple[tuple[int, int], ...]
+    squared_error: Optional[float]
 
 
 # --------------------------------------------------------------------------
@@ -387,15 +415,8 @@ def _border_path(parent, exit_cell, exit_edge: CutEdge) -> list[CutEdge]:
 # --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
-def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> UnwrapResult:
-    """残差切口相位展开（纯函数：不修改 phase/mask）。
-
-    非法输入抛 InvalidPhaseInputError（带 row/col）；搜索预算耗尽抛
-    SearchBudgetExhausted；剩余残差证明无法到达外边界抛 NoSolutionError；
-    环和不是 2π 整数倍抛 UnwrappingContradictionError。
-    """
-    w, m, height, width = _validate(phase, mask, search_budget)
-
+def _unwrap_validated(w, m, height, width, search_budget: int) -> UnwrapResult:
+    """输入已经整体校验并复制为 float/bool 网格后的空间展开主体。"""
     residues, charges = _compute_residues(w, m, height, width)
 
     cuts: set[CutEdge] = set()
@@ -522,4 +543,102 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         regions=tuple(regions_out),
         unwrapped=grid,
         unmet_edges=tuple(unmet),
+    )
+
+
+def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> UnwrapResult:
+    """残差切口相位展开（纯函数：不修改 phase/mask）。
+
+    非法输入抛 InvalidPhaseInputError（带 row/col）；搜索预算耗尽抛
+    SearchBudgetExhausted；剩余残差证明无法到达外边界抛 NoSolutionError；
+    环和不是 2π 整数倍抛 UnwrappingContradictionError。
+    """
+    w, m, height, width = _validate(phase, mask, search_budget)
+    return _unwrap_validated(w, m, height, width, search_budget)
+
+
+# --------------------------------------------------------------------------
+# 相邻两帧：全局整数周对齐
+# --------------------------------------------------------------------------
+def _sse_for_shift(diffs: list[float], k: int) -> float:
+    """Σ(d - 2π·k)²，d = phi_a - phi_b，仅遍历共同有效像素一次。"""
+    total = 0.0
+    for d in diffs:
+        e = d - k * TWO_PI
+        total += e * e
+    return total
+
+
+def align_frames(
+    phase_a,
+    mask_a,
+    phase_b,
+    mask_b,
+    *,
+    search_budget: int = DEFAULT_SEARCH_BUDGET,
+) -> FrameAlignment:
+    """相邻两帧：各自残差切口空间展开后，用共同有效像素做全局整数周对齐。
+
+    步骤（先旧空间展开，再全局对齐）：
+    1. 两帧分别独立调用与 unwrap_phase 完全相同的空间流程（沿用旧数据结构
+       与错误语义）；
+    2. 取两帧 mask 均为 True 的共同有效像素；无共同像素 -> aligned=False，
+       shift=None, squared_error=None, shared_pixels=()，两帧结果原样保留；
+    3. 有共同像素时，d_i = phi_a_i - phi_b_i，选整数 k 最小化
+       Σ(d_i - 2π·k)²。该 SSE 关于 k 是严格凸二次函数，唯一连续最优点为
+       mean(d)/2π，故整数最优只需比较 floor 与 floor+1；平方差严格更小才
+       取 +1，并列（含理论上的均值恰为半点）取较小整数。
+
+    为避免半更新状态：两帧输入先整体校验（shape/类型/数值/budget 一次
+    查完），通过后才开始任何展开计算；任何一帧失败（含预算耗尽、证明
+    无解）都直接抛异常，不返回部分 FrameAlignment。纯函数，不修改输入。
+    """
+    grid_a, boolmask_a, ha, wa_w = _validate(phase_a, mask_a, search_budget)
+    grid_b, boolmask_b, hb, wb_w = _validate(phase_b, mask_b, search_budget)
+    if (ha, wa_w) != (hb, wb_w):
+        raise InvalidPhaseInputError(
+            f"frame shapes differ: frame_a is {ha}x{wa_w}, "
+            f"frame_b is {hb}x{wb_w}"
+        )
+    height, width = ha, wa_w
+
+    # 校验全部通过后才计算；任一帧展开失败即整体失败（无部分结果）。
+    result_a = _unwrap_validated(grid_a, boolmask_a, height, width, search_budget)
+    result_b = _unwrap_validated(grid_b, boolmask_b, height, width, search_budget)
+
+    shared: list[tuple[int, int]] = []
+    diffs: list[float] = []
+    for r in range(height):
+        for c in range(width):
+            if boolmask_a[r][c] and boolmask_b[r][c]:
+                shared.append((r, c))
+                diffs.append(result_a.unwrapped[r][c] - result_b.unwrapped[r][c])
+
+    if not shared:
+        return FrameAlignment(
+            frame_a=result_a,
+            frame_b=result_b,
+            aligned=False,
+            shift=None,
+            shared_pixels=(),
+            squared_error=None,
+        )
+
+    # 连续最优 k* = mean(d)/2π；凸二次只需枚举 floor(k*) 与 floor(k*)+1。
+    n = len(diffs)
+    mean_k = sum(diffs) / (n * TWO_PI)
+    k0 = math.floor(mean_k)
+    sse0 = _sse_for_shift(diffs, k0)
+    sse1 = _sse_for_shift(diffs, k0 + 1)
+    # 严格更小才取较大整数；相等（浮点口径内的并列）取较小整数。
+    shift = k0 if sse0 <= sse1 else k0 + 1
+    sse = sse0 if shift == k0 else sse1
+
+    return FrameAlignment(
+        frame_a=result_a,
+        frame_b=result_b,
+        aligned=True,
+        shift=shift,
+        shared_pixels=tuple(shared),
+        squared_error=sse,
     )

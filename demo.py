@@ -8,6 +8,9 @@
    环路误差——前者在涡核环留下约 2π 的矛盾，后者非切口边全部一致。
 3. 实际触发的边界：NaN 输入被带坐标拒绝；孤岛涡旋证明无解；
    搜索预算耗尽与无解明确区分。
+4. 相邻两帧全局整数周对齐 align_frames：跨 2π 时间跳变（含局部缺测，
+   只用共同有效像素）正常对齐；精确半点并列取较小整数；无共同像素
+   返回未对齐并保留掩码；两帧形状不一致给可定位错误（无半更新）。
 """
 
 import math
@@ -18,6 +21,7 @@ from phasecut import (
     NoSolutionError,
     SearchBudgetExhausted,
     TWO_PI,
+    align_frames,
     unwrap_phase,
     wrap_phase,
 )
@@ -218,6 +222,61 @@ def main():
     ok = unwrap_phase(g2, mask2, search_budget=1_000_000)
     print(f"  同一输入预算充足时正常完成：残差 {len(ok.residues)} 个，"
           f"未满足边 {len(ok.unmet_edges)} 条 —— 耗尽是“没算完”，不是无解。")
+
+    # --- 4. 相邻两帧全局整数周对齐 align_frames ----------------------------
+    section("4a. 相邻两帧对齐：跨 2π 时间跳变 + 局部缺测（只用共同像素）")
+    # 3x3 网格上只有对角像素有效；A 帧取值 +pi-0.01，B 帧同一物理点取到
+    # -pi+0.01（包裹在 2π 边界两侧，物理上相差一个整周）。中心 (1,1) 在
+    # B 帧缺测（局部缺测），另带一个 B 独占像素，二者都不得计入 SSE。
+    eps = 0.01
+    ga = [[PI - eps, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, PI - eps]]
+    gb = [[-PI + eps, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, -PI + eps]]
+    ma = [[True, False, False], [False, True, False], [False, False, True]]
+    mb = [[True, False, False], [False, False, True], [False, False, True]]
+    al = align_frames(ga, ma, gb, mb)
+    print(f"  A 有效像素          : {[(r, c) for r in range(3) for c in range(3) if ma[r][c]]}")
+    print(f"  B 有效像素          : {[(r, c) for r in range(3) for c in range(3) if mb[r][c]]}")
+    print(f"  共同有效像素        : {list(al.shared_pixels)}（中心 (1,1) B 缺测，被排除）")
+    print(f"  全局整数周偏移 k    : {al.shift}")
+    print(f"  对齐后 SSE          : {al.squared_error:.6f} rad²")
+    # 手算核对：共同像素 d=2pi-0.02；k=1 残差 -0.02，SSE=2*(0.02)^2=8e-4；
+    # k=0 的 SSE 约 2*(2pi)^2≈78.96，故 k=1 唯一最优。
+    d0 = ga[0][0] - gb[0][0]
+    sse_k0 = 2.0 * d0 * d0
+    print(f"  手算核对: d={d0:+.4f}，SSE(k=0)={sse_k0:.4f}，"
+          f"SSE(k=1)=2*(0.02)^2={2 * 0.02 ** 2:.4f} -> k=1 唯一最优")
+    for r, c in al.shared_pixels:
+        print(f"  共同像素 ({r},{c}): phi_a={al.frame_a.unwrapped[r][c]:+.4f}, "
+              f"phi_b+2pi*k={al.frame_b.unwrapped[r][c] + al.shift * TWO_PI:+.4f}")
+
+    section("4b. 并列取较小整数：两个共同像素差恰为 +pi（mean/2pi=0.5）")
+    ga2 = [[0.0, 0.0]]
+    gb2 = [[-PI, -PI]]
+    m2 = [[True, True]]
+    al2 = align_frames(ga2, m2, gb2, m2)
+    print(f"  SSE(k=0)=SSE(k=1)=2*pi^2={2 * PI * PI:.6f}；实际选择 k={al2.shift}"
+          f"（并列取较小整数），SSE={al2.squared_error:.6f}")
+
+    section("4c. 无共同有效像素：未对齐状态（不是异常），掩码保留")
+    ga3 = [[0.1, 0.2], [0.3, 0.4]]
+    gb3 = [[0.5, -0.5], [1.0, -1.0]]
+    ma3 = [[True, False], [False, True]]
+    mb3 = [[False, True], [True, False]]
+    al3 = align_frames(ga3, ma3, gb3, mb3)
+    print(f"  aligned={al3.aligned}, shift={al3.shift}, "
+          f"squared_error={al3.squared_error}")
+    print(f"  A 展开网格（无效位 None）: {al3.frame_a.unwrapped}")
+    print(f"  B 展开网格（无效位 None）: {al3.frame_b.unwrapped}")
+
+    section("4d. 实际错误：两帧形状不一致 —— 明确拒绝，无半更新状态")
+    try:
+        align_frames(
+            [[0.1, 0.2], [0.3, 0.4]], [[True, True], [True, True]],
+            [[0.1, 0.2, 0.3]], [[True, True, True]],
+        )
+    except InvalidPhaseInputError as exc:
+        print(f"  实际捕获 {type(exc).__name__}: {exc}")
+        print("  两帧输入均未被修改（纯函数），也不存在半完成的对齐结果。")
 
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 68)

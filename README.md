@@ -1,11 +1,17 @@
 # phasecut — 图像相位展开的残差切口模块
 
-二维包裹相位（wrapped phase）的**残差切口（residual / branch-cut）展开**。
+二维包裹相位（wrapped phase）的**残差切口（residual / branch-cut）展开**，
+并提供**相邻两帧的全局整数周对齐**。
+
 在 ≤32×32 的包裹相位与有效像素 mask 上：定位每个 2×2 环路的整数残差电荷，
 把异号电荷按最短曼哈顿有效路径配对、剩余电荷连到图像外边界，路径经过的
 像素边置为不可跨越的切口，再在每个切口连通区内从字典序最小像素洪泛展开。
 结果把数据矛盾（涡旋）显式放到切口和 `unmet_edges` 里，**不用看似平滑的
 展开结果掩盖 ±2π 的环矛盾**。
+
+相邻两帧先各自独立完成上述空间展开（旧空间展开），再取**两帧共同有效像素**，
+选一个**全局整数周偏移 k** 使共同像素上两帧展开值的平方差（SSE）最小；
+无共同像素时返回未对齐状态（不是异常），两帧结果与掩码原样保留。
 
 - Python：**3.14.7**（3.10+ 的语法也可运行，但按 3.14.7 验收）
 - 依赖：**仅 Python 标准库**（`math`、`collections`、`typing`）。装好 Python 后
@@ -15,7 +21,7 @@
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（30 个用例，含 200+6 例确定性 fuzz）
+python -m unittest discover -s tests -v   # 必要测试（47 个用例：旧空间 30 + 帧对齐 17，含两组确定性 fuzz）
 python demo.py                             # 固定输入演示，约 0.03 秒
 ```
 
@@ -24,10 +30,14 @@ python demo.py                             # 固定输入演示，约 0.03 秒
 ## 接口
 
 ```python
-from phasecut import unwrap_phase, wrap_phase
+from phasecut import unwrap_phase, align_frames, wrap_phase
 
 result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
+alignment = align_frames(phase_a, mask_a, phase_b, mask_b, *,
+                         search_budget=1_000_000)
 ```
+
+### 单帧空间展开 `unwrap_phase`
 
 - `phase`：行序列的行序列，每个元素为 `int`/`float`（拒绝 `bool`、`complex`、
   字符串），必须**有限**（拒绝 NaN/±Infinity）且落在 **[-π, π)**。
@@ -61,6 +71,39 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 `SearchBudgetExhausted`（不知道有没有解）与 `NoSolutionError`（证明无解）
 是两个不同异常，绝不混用。`demo.py` 3c 用同一输入分别演示两者。
 
+### 相邻两帧全局整数周对齐 `align_frames`
+
+```python
+alignment = align_frames(phase_a, mask_a, phase_b, mask_b, *,
+                         search_budget=1_000_000)
+```
+
+- 四个输入的类型/数值口径与 `unwrap_phase` 完全一致；两帧形状必须相同
+  （同高同宽），否则抛 `InvalidPhaseInputError`。
+- 两帧先**各自独立**走与 `unwrap_phase` 完全相同的空间展开（因此各自的
+  残差、切口、分区、`unmet_edges` 语义不变；任一帧预算耗尽或证明无解，
+  整个调用抛同一异常，**不返回半完成结果**）。
+- 然后只取两帧 mask 同时为 `True` 的**共同有效像素**，在它们的展开值上
+  求一个全局整数 k 最小化 `SSE(k)=Σ(φₐ-(φ_b+2πk))²`。SSE 关于 k 是
+  严格凸二次函数，连续最优点 `k*=mean(φₐ-φ_b)/2π`，故只需比较
+  `floor(k*)` 与 `floor(k*)+1`；**平方差严格更小才取较大整数，相等
+  （含理论上恰为半点）取较小整数**。
+- **无共同像素**：不抛异常，返回未对齐状态 `aligned=False`。
+
+返回不可变 `FrameAlignment`：
+
+| 字段 | 含义 |
+|---|---|
+| `frame_a` / `frame_b` | 两帧各自完整的 `UnwrapResult`（旧空间展开结果，含掩码：无效位为 `None`）。 |
+| `aligned` | 是否存在 ≥1 个共同有效像素。`False` 时后三个对齐字段为 `None`/`()`。 |
+| `shift` | 全局整数周偏移 k（`φ_b` 对齐到 `φₐ`：`φ_b_aligned=φ_b+2π·k`）；未对齐时为 `None`。 |
+| `shared_pixels` | 共同有效像素坐标元组，按字典序；无共同像素为 `()`。 |
+| `squared_error` | 对齐后共同像素上的 SSE（rad²）；未对齐时为 `None`。 |
+
+错误语义：两帧各自的输入错误都给 `InvalidPhaseInputError`（帧 B 的坐标
+同样可由 `row`/`col` 定位）；帧形状不一致也归此异常；`search_budget`
+口径同单帧。校验在任何展开计算**之前**整体完成，无半更新状态。
+
 ## 算法与设计取舍
 
 1. **残差**：每个四点全有效的 2×2 环，取逆时针四条包裹邻差
@@ -93,6 +136,13 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 为 0，因此**区与区之间可能相差任意整数个 2π**，本模块不做跨区/全局相位
 对齐（题面未定义外部基准）。
 
+7. **相邻两帧全局整数周对齐**（`align_frames`）：两帧分别独立完成 1–6
+   的空间展开后，在共同有效像素上对全局整数 k 最小化 SSE。凸二次闭式
+   决定只需枚举 `floor(mean(d)/2π)` 与 +1 两个整数（实现里直接算两个
+   SSE 比较），并列取较小者；**不做**全时空联合图优化、不施加逐像素
+   运动/光流约束。局部缺测像素（任一帧 mask 为 False）不参与统计；
+   完全无共同像素时如实返回未对齐。
+
 ## 浮点误差口径
 
 - 残差判定口径 `RESIDUE_TOLERANCE = 1e-9 rad`：环和与最近 2π 整数倍的
@@ -119,13 +169,26 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   直接体现，确定性用例与 200 例随机 fuzz 均有覆盖。
 - 贪心配对不保证切口总长度全局最小。
 - 不做区之间的全局 2π 对齐；`baseline` 恒为 0。
+- 帧对齐只是**单一全局整数周**平移：两帧切口分区基准不同或存在真实
+  非整数周亚像素运动时，单个共同像素的对齐残差可以超过 π（一个全局
+  整数无法逐点抹平）；此时 `squared_error` 如实给出残差能量，不做
+  逐像素运动估计，也不做全时空联合优化。帧间真实位移、旋转、缩放、
+  配准均不在范围内；要求两帧网格同形、像素同位。
+- `align_frames` 不做时序链式传播：一次调用只处理相邻两帧，多帧序列
+  的漂移/累积误差不在本次范围内。
 
 ## 文件
 
 - `phasecut.py` — 唯一核心模块，可直接 `import phasecut`。
-- `tests/test_phasecut.py` — 必要测试。期望值由文件内的**独立**参考实现
-  产生（`atan2(sin,cos)` 包裹、独立四点环和、独立 BFS/拓扑复核、解析
-  多涡旋数据生成），不调用被测核心来得到期望值；`wrap` 往返一致性仅作
-  补充断言。
+- `tests/test_phasecut.py` — 旧空间展开的必要测试（30 个，全部保留）。
+  期望值由文件内的**独立**参考实现产生（`atan2(sin,cos)` 包裹、独立四点
+  环和、独立 BFS/拓扑复核、解析多涡旋数据生成），不调用被测核心来得到
+  期望值；`wrap` 往返一致性仅作补充断言。
+- `tests/test_align_frames.py` — 帧对齐的必要测试（17 个）。最优 shift
+  由测试内对 k∈[-8,8] 的**独立小规模枚举**（升序、严格更优才替换，
+  天然并列取小整数）给出，跨 2π/半点并列的 SSE 用手算闭式值核对，
+  不调用被测实现产生期望值；含 120 例固定种子两帧 fuzz。
 - `demo.py` — 固定输入：无涡旋斜坡（频繁跨 π）、单涡旋参考的切口前后
-  矛盾度量，以及 NaN 拒绝、孤岛无解、预算耗尽三个实际触发的边界。
+  矛盾度量，NaN 拒绝、孤岛无解、预算耗尽三个实际触发的边界，以及帧对齐
+  的跨 2π+局部缺测正常结果、并列取小整数、无共同像素未对齐、形状不一致
+  实际错误。
