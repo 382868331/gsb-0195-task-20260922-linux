@@ -7,6 +7,11 @@
 结果把数据矛盾（涡旋）显式放到切口和 `unmet_edges` 里，**不用看似平滑的
 展开结果掩盖 ±2π 的环矛盾**。
 
+本轮新增**相邻两帧的全局整数周时间对齐**（`align_frame_pair`）：两帧各自
+独立做上述空间展开，再在两帧共同有效像素上枚举一个全局整数周偏移 K，
+使平方差 Σ(φ1−(φ2+2πK))² 最小，并列取较小整数；无共同像素时返回未对齐
+状态、完整保留两帧结果与掩码。
+
 - Python：**3.14.7**（3.10+ 的语法也可运行，但按 3.14.7 验收）
 - 依赖：**仅 Python 标准库**（`math`、`collections`、`typing`）。装好 Python 后
   无需安装任何其他东西；核心、测试、演示全部离线、确定性运行。
@@ -15,7 +20,7 @@
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（30 个用例，含 200+6 例确定性 fuzz）
+python -m unittest discover -s tests -v   # 必要测试（46 个用例，含 200+6+60 例确定性 fuzz）
 python demo.py                             # 固定输入演示，约 0.03 秒
 ```
 
@@ -24,9 +29,11 @@ python demo.py                             # 固定输入演示，约 0.03 秒
 ## 接口
 
 ```python
-from phasecut import unwrap_phase, wrap_phase
+from phasecut import unwrap_phase, wrap_phase, align_frame_pair
 
 result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
+alignment = align_frame_pair(phase1, mask1, phase2, mask2,
+                             *, search_budget=1_000_000)  # 见下节
 ```
 
 - `phase`：行序列的行序列，每个元素为 `int`/`float`（拒绝 `bool`、`complex`、
@@ -60,6 +67,46 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 
 `SearchBudgetExhausted`（不知道有没有解）与 `NoSolutionError`（证明无解）
 是两个不同异常，绝不混用。`demo.py` 3c 用同一输入分别演示两者。
+
+## 相邻两帧时间对齐：`align_frame_pair`
+
+```python
+from phasecut import align_frame_pair
+
+al = align_frame_pair(phase1, mask1, phase2, mask2, *, search_budget=1_000_000)
+```
+
+- 四组参数的类型/数值口径与 `unwrap_phase` 完全一致；两帧形状必须相同，
+  否则抛 `InvalidPhaseInputError`（跨帧同坐标对应才有定义）。
+- 纯函数，不修改任何输入；先完整校验两帧，再各自独立做残差切口展开
+  （`unwrap_phase`，旧契约不变），任一帧失败（预算耗尽 / 证明无解 /
+  环矛盾）时原异常传播，**不构造、不返回半对齐结果**。
+- 然后只在两帧 mask 均为 True 的**共同有效像素**上，枚举一个**全局整数
+  周偏移 K**，最小化
+  `SSE(K) = Σ(φ1 − (φ2 + 2π·K))²`；K 并列（SSE 差
+  ≤ `ALIGNMENT_SSE_TOLERANCE = 1e-9 rad²`）时取较小整数。
+  枚举上下界由共同像素逐像素最优周数 `round(d/2π)` 夹出（±1 周余量），
+  ≤32×32 规模下直接枚举，无近似、无外部依赖。
+- **没有任何共同像素时不报错**：返回 `aligned=False` 的未对齐状态，
+  `offset_cycles=None`、`sse=None`，但两帧的 `UnwrapResult`、掩码信息
+  都完整保留，`aligned_frame2` 退化为帧2自身的展开。
+
+返回不可变的 `FrameAlignment`：
+
+| 字段 | 含义 |
+|---|---|
+| `aligned` | 是否成功选出全局偏移（存在共同像素即为 True）。 |
+| `offset_cycles` | 帧2相对帧1的全局整数周偏移 K；对齐后帧2 = `frame2.unwrapped + 2π·K`。未对齐为 `None`。 |
+| `common_pixels` | 两帧共同有效像素坐标，字典序排列。 |
+| `sse` | 最小平方差（rad²，仅在共同像素上计）；未对齐为 `None`。 |
+| `frame1` / `frame2` | 两帧各自的完整 `UnwrapResult`（残差、切口、分区、未满足边都在）。 |
+| `aligned_frame2` | 帧2展开值整体加 2π·K 后的同形网格；K 作用于**帧2全部有效像素**（含帧1缺测处），任一帧无效位置为 `None`；未对齐时等于 `frame2.unwrapped`。 |
+
+对齐误差口径：SSE 并列判定 `ALIGNMENT_SSE_TOLERANCE = 1e-9 rad²`。真正的
+整数周差异（共同像素上贡献量级 ~10 rad² 以上）必然可分辨；该口径只吸收
+同值重复求和的 ~1e-27 量级浮点散布。空间展开本身的 ±2π 不确定性（各区
+`baseline=0`）原样进入对齐：这正是“用两帧共同有效像素选全局整数周偏移”
+要消除的东西；单帧 `unwrap_phase` 行为不变。
 
 ## 算法与设计取舍
 
@@ -119,13 +166,20 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   直接体现，确定性用例与 200 例随机 fuzz 均有覆盖。
 - 贪心配对不保证切口总长度全局最小。
 - 不做区之间的全局 2π 对齐；`baseline` 恒为 0。
+- 帧对齐只选**一个**全局整数周偏移（题面限定范围）：不做全时空联合图
+  优化、不做逐像素运动/光流约束，因此两帧间真实存在的**空间变化**运动
+  （不同像素不同周数）不会被建模，只会体现在 SSE 数值里；全局 K 是该
+  尺度下平方差最优的单一常数。对齐只处理相邻两帧，不做多帧链/长序列
+  传播；共同像素为零时不猜测偏移。
 
 ## 文件
 
 - `phasecut.py` — 唯一核心模块，可直接 `import phasecut`。
 - `tests/test_phasecut.py` — 必要测试。期望值由文件内的**独立**参考实现
   产生（`atan2(sin,cos)` 包裹、独立四点环和、独立 BFS/拓扑复核、解析
-  多涡旋数据生成），不调用被测核心来得到期望值；`wrap` 往返一致性仅作
-  补充断言。
+  多涡旋数据生成、独立的全范围 K 枚举参考），不调用被测核心来得到期望值；
+  `wrap` 往返一致性仅作补充断言。
 - `demo.py` — 固定输入：无涡旋斜坡（频繁跨 π）、单涡旋参考的切口前后
-  矛盾度量，以及 NaN 拒绝、孤岛无解、预算耗尽三个实际触发的边界。
+  矛盾度量，NaN 拒绝、孤岛无解、预算耗尽三个空间展开边界，以及相邻帧
+  对齐的正常结果（跨 2π + 双帧局部缺测、非零 K）、无共同像素未对齐
+  边界和形状不一致的实际错误。

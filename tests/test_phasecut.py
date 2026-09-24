@@ -22,6 +22,7 @@ from phasecut import (
     SearchBudgetExhausted,
     wrap_phase,
     unwrap_phase,
+    align_frame_pair,
     TWO_PI,
 )
 
@@ -814,6 +815,348 @@ class TestContradictionContract(unittest.TestCase):
         exc = UnwrappingContradictionError(2, 3, 0.7)
         self.assertEqual((exc.row, exc.col, exc.loop_sum), (2, 3, 0.7))
         self.assertIsInstance(exc, phasecut.PhaseCutError)
+
+
+# --------------------------------------------------------------------------
+# 相邻两帧时间对齐（本轮新增能力）
+# --------------------------------------------------------------------------
+def ref_flood_unwrap(g, mask):
+    """独立单源/多源洪泛展开（各区锚点 k=0），不布切口。
+
+    仅在 ref_residues 为空、且不存在绕 mask 洞卷绕的场上使用
+    （完整 mask 的斜坡场、或全场真值落在 (-pi,pi) 内时严格成立）。
+    """
+    h, w = len(mask), len(mask[0])
+    valid = {(r, c) for r in range(h) for c in range(w) if mask[r][c]}
+    phi = {}
+    for start in sorted(valid):
+        if start in phi:
+            continue
+        phi[start] = g[start[0]][start[1]]
+        stack = [start]
+        while stack:
+            r, c = stack.pop()
+            for dr, dc in ((-1, 0), (0, 1), (1, 0), (0, -1)):
+                nxt = (r + dr, c + dc)
+                if nxt not in valid or nxt in phi:
+                    continue
+                d = ref_wrap(g[nxt[0]][nxt[1]] - g[r][c])
+                expect = phi[(r, c)] + d
+                k = int(math.floor(abs((expect - g[nxt[0]][nxt[1]]) / TWO_PI) + 0.5))
+                k = k if expect - g[nxt[0]][nxt[1]] >= 0 else -k
+                phi[nxt] = g[nxt[0]][nxt[1]] + k * TWO_PI
+                stack.append(nxt)
+    return phi
+
+
+def ref_align_enumerate(phi1, phi2, m1, m2):
+    """独立参考：在共同有效像素上全范围枚举整数 K，取 SSE 最小，并列取小者。
+
+    枚举范围对测试用的小网格取固定的 [-50, 50]（远超任何可达偏移），
+    与核心的范围自适应逻辑完全独立。
+    """
+    h, w = len(m1), len(m1[0])
+    common = tuple(
+        (r, c) for r in range(h) for c in range(w) if m1[r][c] and m2[r][c]
+    )
+    diffs = [phi1[(r, c)] - phi2[(r, c)] for (r, c) in common]
+    best_k, best_sse = None, None
+    for k in range(-50, 51):
+        shift = k * TWO_PI
+        v = sum((d - shift) ** 2 for d in diffs)
+        if best_sse is None or v < best_sse - 1e-9:
+            best_k, best_sse = k, v
+    return common, best_k, best_sse
+
+
+class TestFrameAlignmentHandComputed(unittest.TestCase):
+    """手算例子：期望值直接写死，不经任何实现推导。"""
+
+    def test_single_common_pixel_positive_offset(self):
+        # 1x2 单行（无 2x2 环、无切口），仅 (0,1) 共同有效。
+        # φ1=2.5，φ2=-1.5 => d=4.0。
+        # K=0: SSE=16；K=1: (4-2π)²≈5.21 => 最优 K=1。
+        g1 = [[2.5, 2.5]]
+        g2 = [[0.0, -1.5]]  # (0,0) 在帧2无效，值随便给但需合法
+        m1 = [[True, True]]
+        m2 = [[False, True]]
+        res = align_frame_pair(g1, m1, g2, m2)
+        self.assertTrue(res.aligned)
+        self.assertEqual(res.offset_cycles, 1)
+        self.assertEqual(res.common_pixels, ((0, 1),))
+        self.assertAlmostEqual(res.sse, (4.0 - TWO_PI) ** 2, places=12)
+        # 对齐后帧2共同像素：-1.5 + 2π，与帧2自己的无效位保留 None。
+        self.assertIsNone(res.aligned_frame2[0][0])
+        self.assertAlmostEqual(
+            res.aligned_frame2[0][1], -1.5 + TWO_PI, places=12
+        )
+        # 帧1独有像素不受影响；两帧的空间展开结果都完整保留。
+        self.assertEqual(res.frame1.unwrapped[0][0], 2.5)
+        self.assertIsNone(res.frame2.unwrapped[0][0])
+
+    def test_tie_at_pi_picks_smaller_integer(self):
+        # 恰好在 ±π 分界并列：唯一共同像素 d=-π（g1=-π 合法，g2=0）。
+        # SSE(0)=π²，SSE(-1)=(-π+2π)²=π² 精确并列 => 取较小整数 -1。
+        res = align_frame_pair([[-PI]], [[True]], [[0.0]], [[True]])
+        self.assertTrue(res.aligned)
+        self.assertEqual(res.offset_cycles, -1)
+        self.assertAlmostEqual(res.sse, PI ** 2, places=12)
+        self.assertAlmostEqual(res.aligned_frame2[0][0], -TWO_PI, places=12)
+
+    def test_multi_pixel_cross_2pi_ramp_with_local_missing(self):
+        # 1x6 斜坡，帧2缺前两个测点：φ1=2.5c（多次跨 2π 包裹），
+        # 帧2真值 = 2.5c - 4.0、锚点在 c=2（φ2(2)=1.0）。
+        # 四个共同像素 d 恒为 4.0 => K=1，SSE=4·(4-2π)²，手算可核。
+        g1 = [[wrap_phase(2.5 * c) for c in range(6)]]
+        g2 = [[wrap_phase(2.5 * c - 4.0) for c in range(6)]]
+        m1 = [[True] * 6]
+        m2 = [[False, False] + [True] * 4]
+        res = align_frame_pair(g1, m1, g2, m2)
+        self.assertTrue(res.aligned)
+        self.assertEqual(res.offset_cycles, 1)
+        self.assertEqual(
+            res.common_pixels, tuple((0, c) for c in range(2, 6))
+        )
+        self.assertAlmostEqual(res.sse, 4.0 * (4.0 - TWO_PI) ** 2, places=9)
+        # 对齐后每个共同像素的残差恒为 4-2π ≈ -2.2832。
+        for c in range(2, 6):
+            self.assertLess(
+                abs(res.frame1.unwrapped[0][c]
+                    - res.aligned_frame2[0][c] - (4.0 - TWO_PI)),
+                1e-9,
+            )
+        # 两帧残差、切口皆为空（单行无环）。
+        self.assertEqual(res.frame1.residues, ())
+        self.assertEqual(res.frame2.residues, ())
+        self.assertEqual(res.frame1.cuts, ())
+
+    def test_frame2_only_pixel_still_gets_global_shift(self):
+        # 帧1在 (1,1) 有局部缺测，帧2有效：全局 K 仍作用于帧2全部有效像素。
+        g1 = [[wrap_phase(0.3 * r + 0.2 * c) for c in range(3)]
+              for r in range(3)]
+        g2 = [[wrap_phase(0.3 * r + 0.2 * c + 4.0) for c in range(3)]
+              for r in range(3)]
+        m1 = [[True] * 3 for _ in range(3)]
+        m1[1][1] = False
+        m2 = [[True] * 3 for _ in range(3)]
+        res = align_frame_pair(g1, m1, g2, m2)
+        self.assertTrue(res.aligned)
+        self.assertNotIn((1, 1), res.common_pixels)
+        k = res.offset_cycles
+        # 帧2独有像素也被整体平移（不是 None，也不是未平移值）。
+        self.assertAlmostEqual(
+            res.aligned_frame2[1][1],
+            res.frame2.unwrapped[1][1] + k * TWO_PI,
+            places=12,
+        )
+
+
+class TestFrameAlignmentRamps(unittest.TestCase):
+    """跨 2π 变化的斜坡帧对：独立洪泛 + 独立枚举核对。"""
+
+    def test_steep_ramps_independent_reference(self):
+        h = w = 10
+        t1 = [[0.9 * r + 2.5 * c for c in range(w)] for r in range(h)]
+        g1 = [[wrap_phase(v) for v in row] for row in t1]
+        m1 = all_true(h, w)
+        phi1 = ref_flood_unwrap(g1, m1)
+        for delta in (0.4, -2.0, 5.0, -5.0):
+            with self.subTest(delta=delta):
+                g2 = [[wrap_phase(v + delta) for v in row] for row in t1]
+                m2 = all_true(h, w)
+                self.assertEqual(ref_residues(g1, m1), [])
+                self.assertEqual(ref_residues(g2, m2), [])
+                phi2 = ref_flood_unwrap(g2, m2)
+                common, exp_k, exp_sse = ref_align_enumerate(
+                    phi1, phi2, m1, m2
+                )
+                res = align_frame_pair(g1, m1, g2, m2)
+                self.assertTrue(res.aligned)
+                self.assertEqual(res.offset_cycles, exp_k)
+                self.assertEqual(res.common_pixels, common)
+                self.assertAlmostEqual(res.sse, exp_sse, places=8)
+                # 手算关系：同锚点同梯度 => d 恒为 -wrap(delta)，
+                # 故 |wrap(delta)|<π 时 K 必为 0。
+                self.assertEqual(exp_k, 0)
+                self.assertAlmostEqual(
+                    exp_sse, h * w * ref_wrap(delta) ** 2, places=8
+                )
+
+    def test_differing_anchor_enables_nonzero_k(self):
+        # 完整 2D 斜坡 + 帧2锚点像素缺测：独立参考给出非零 K。
+        h, w = 3, 6
+        t1 = [[2.5 * c for c in range(w)] for _ in range(h)]
+        t2 = [[2.5 * c - 4.0 for c in range(w)] for _ in range(h)]
+        g1 = [[wrap_phase(v) for v in row] for row in t1]
+        g2 = [[wrap_phase(v) for v in row] for row in t2]
+        m1 = all_true(h, w)
+        m2 = [[True] * w for _ in range(h)]
+        m2[0][0] = False
+        phi1 = ref_flood_unwrap(g1, m1)
+        phi2 = ref_flood_unwrap(g2, m2)
+        _common, exp_k, exp_sse = ref_align_enumerate(phi1, phi2, m1, m2)
+        self.assertEqual(exp_k, 1)  # 独立参考自身先确认是非平凡解
+        res = align_frame_pair(g1, m1, g2, m2)
+        self.assertEqual(res.offset_cycles, 1)
+        self.assertAlmostEqual(res.sse, exp_sse, places=8)
+
+    def test_same_wrapped_field_zero_shift_is_perfect(self):
+        # 帧2真值恰好多整数个 2π：包裹输入完全相同 => K=0、SSE=0。
+        h = w = 7
+        t = [[0.9 * r + 2.5 * c for c in range(w)] for r in range(h)]
+        g1 = [[wrap_phase(v) for v in row] for row in t]
+        g2 = [[wrap_phase(v + 3 * TWO_PI) for v in row] for row in t]
+        res = align_frame_pair(g1, all_true(h, w), g2, all_true(h, w))
+        self.assertEqual(res.offset_cycles, 0)
+        # 同包裹场展开差只有 ~1e-14 的浮点散布，SSE 在 1e-27 量级。
+        self.assertLess(res.sse, 1e-18)
+
+
+class TestFrameAlignmentMasksAndFailures(unittest.TestCase):
+    def test_no_common_pixels_is_unaligned_and_preserves_masks(self):
+        # 两帧有效像素完全不相交：返回未对齐状态，无异常。
+        h = w = 4
+        m1 = [[False] * w for _ in range(h)]
+        m2 = [[False] * w for _ in range(h)]
+        m1[0][0] = True
+        m2[3][3] = True
+        g = [[0.1 * c for c in range(w)] for _ in range(h)]
+        res = align_frame_pair(g, m1, g, m2)
+        self.assertFalse(res.aligned)
+        self.assertIsNone(res.offset_cycles)
+        self.assertIsNone(res.sse)
+        self.assertEqual(res.common_pixels, ())
+        # 两帧展开结果仍完整保留；aligned_frame2 退化为帧2展开。
+        self.assertEqual(res.aligned_frame2, res.frame2.unwrapped)
+        self.assertIsNone(res.aligned_frame2[0][0])
+        self.assertEqual(res.aligned_frame2[3][3], g[3][3])
+        self.assertEqual(res.frame1.regions[0].anchor, (0, 0))
+        self.assertEqual(res.frame2.regions[0].anchor, (3, 3))
+
+    def test_both_frames_empty_mask(self):
+        g = [[0.0] * 3 for _ in range(3)]
+        m = [[False] * 3 for _ in range(3)]
+        res = align_frame_pair(g, m, g, m)
+        self.assertFalse(res.aligned)
+        self.assertEqual(res.frame1.regions, ())
+        self.assertEqual(res.common_pixels, ())
+
+    def test_shape_mismatch_rejected(self):
+        g = [[0.0] * 3 for _ in range(3)]
+        m = [[True] * 3 for _ in range(3)]
+        g2 = [[0.0] * 2 for _ in range(3)]
+        m2 = [[True] * 2 for _ in range(3)]
+        with self.assertRaises(InvalidPhaseInputError):
+            align_frame_pair(g, m, g2, m2)
+
+    def test_invalid_value_in_frame2_rejected_and_inputs_untouched(self):
+        g1 = [[0.1, 0.2], [0.3, 0.4]]
+        g2 = [[0.1, float("nan")], [0.3, 0.4]]
+        m = [[True, True], [True, True]]
+        snap1 = [row[:] for row in g1]
+        with self.assertRaises(InvalidPhaseInputError) as cm:
+            align_frame_pair(g1, m, g2, m)
+        self.assertEqual((cm.exception.row, cm.exception.col), (0, 1))
+        self.assertEqual(g1, snap1)
+        # NaN != NaN，逐元素核对 g2 除故障点外未被修改。
+        self.assertTrue(math.isnan(g2[0][1]))
+        self.assertEqual(g2[0][0], 0.1)
+        self.assertEqual(g2[1], [0.3, 0.4])
+
+    def test_bool_mask_in_frame1_rejected(self):
+        with self.assertRaises(InvalidPhaseInputError):
+            align_frame_pair(
+                [[0.0, 0.0]], [[1, 1]], [[0.0, 0.0]], [[True, True]]
+            )
+
+    def test_bool_budget_rejected(self):
+        g = [[0.0]]
+        m = [[True]]
+        with self.assertRaises(InvalidPhaseInputError):
+            align_frame_pair(g, m, g, m, search_budget=False)
+
+    def test_frame2_no_solution_propagates(self):
+        # 帧2是孤岛单涡旋：空间展开已证明无解，对齐直接传播、不返回半结果。
+        h = w = 11
+        island = [[False] * w for _ in range(h)]
+        for r in range(4, 7):
+            for c in range(4, 7):
+                island[r][c] = True
+        g = analytic_vortices(h, w, {(4, 4): 1})
+        full = all_true(h, w)
+        with self.assertRaises(NoSolutionError):
+            align_frame_pair(g, full, g, island)
+
+    def test_frame1_budget_exhausted_propagates(self):
+        g = analytic_vortex(9, 9, 4, 4)
+        m = all_true(9, 9)
+        with self.assertRaises(SearchBudgetExhausted):
+            align_frame_pair(g, m, g, m, search_budget=1)
+
+
+class TestFrameAlignmentFuzz(unittest.TestCase):
+    """固定种子随机 mask 对：真值全程落在 (-pi,pi)，空间展开恒等于真值，
+    于是 K/SSE 可由解析关系直接独立核对。"""
+
+    def test_random_mask_pairs_analytic_and_deterministic(self):
+        rng = random.Random(20260924)
+        h = w = 7
+        shifts = (-1.7, -0.6, 0.0, 0.9, 2.0)  # 均使帧2真值留在 (-pi,pi)
+        n_aligned = n_unaligned = 0
+        # 首个用例固定为掩码完全不相交（确定性覆盖未对齐分支），
+        # 其余 59 个用随机掩码对。
+        forced_disjoint = (
+            [[(r + c) % 2 == 0 for c in range(w)] for r in range(h)],
+            [[(r + c) % 2 == 1 for c in range(w)] for r in range(h)],
+        )
+        random_pairs = []
+        for _ in range(59):
+            # 两帧密度独立选取；低密度时也会随机出现无共同像素的帧对。
+            p1 = rng.choice((0.2, 0.5, 0.8))
+            p2 = rng.choice((0.2, 0.5, 0.8))
+            random_pairs.append((
+                [[rng.random() < p1 for _ in range(w)] for _ in range(h)],
+                [[rng.random() < p2 for _ in range(w)] for _ in range(h)],
+            ))
+        for m1, m2 in [forced_disjoint] + random_pairs:
+            s = rng.choice(shifts)
+            t1 = [[0.2 * r + 0.1 * c - 1.2 for c in range(w)]
+                  for r in range(h)]
+            t2 = [[v + s for v in row] for row in t1]
+            g1 = [[wrap_phase(v) for v in row] for row in t1]
+            g2 = [[wrap_phase(v) for v in row] for row in t2]
+            res = align_frame_pair(g1, m1, g2, m2)
+            common = tuple(
+                (r, c) for r in range(h) for c in range(w)
+                if m1[r][c] and m2[r][c]
+            )
+            self.assertEqual(res.common_pixels, common)
+            if not common:
+                n_unaligned += 1
+                self.assertFalse(res.aligned)
+                self.assertIsNone(res.offset_cycles)
+                self.assertEqual(res.aligned_frame2, res.frame2.unwrapped)
+                continue
+            n_aligned += 1
+            self.assertTrue(res.aligned)
+            # 真值在包裹区间内 => 展开即真值，d=-s，|s|<π => K=0。
+            self.assertEqual(res.offset_cycles, 0)
+            self.assertAlmostEqual(res.sse, len(common) * s * s, places=9)
+            for (r, c) in common:
+                self.assertAlmostEqual(
+                    res.aligned_frame2[r][c] - res.frame1.unwrapped[r][c],
+                    s,
+                    places=9,
+                )
+                self.assertIsNotNone(res.aligned_frame2[r][c])
+            # 确定性：同输入两次调用完全相等。
+            res2 = align_frame_pair(
+                [row[:] for row in g1], [row[:] for row in m1],
+                [row[:] for row in g2], [row[:] for row in m2],
+            )
+            self.assertEqual(res, res2)
+        self.assertGreater(n_aligned, 40)
+        self.assertGreaterEqual(n_unaligned, 1)
 
 
 if __name__ == "__main__":

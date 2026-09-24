@@ -20,6 +20,7 @@ from phasecut import (
     TWO_PI,
     unwrap_phase,
     wrap_phase,
+    align_frame_pair,
 )
 
 PI = math.pi
@@ -218,6 +219,71 @@ def main():
     ok = unwrap_phase(g2, mask2, search_budget=1_000_000)
     print(f"  同一输入预算充足时正常完成：残差 {len(ok.residues)} 个，"
           f"未满足边 {len(ok.unmet_edges)} 条 —— 耗尽是“没算完”，不是无解。")
+
+    # --- 4. 相邻两帧全局整数周对齐（正常结果：跨 2π + 局部缺测） ----------
+    section("4. 相邻帧对齐 4x8（斜坡列梯度 2.5 跨 2π；两帧各有局部缺测）")
+    h, wd = 4, 8
+    truth1 = [[0.2 * r + 2.5 * c for c in range(wd)] for r in range(h)]
+    bias = -4.0  # 帧2真值整体低 4.0 rad
+    truth2 = [[v + bias for v in row] for row in truth1]
+    f1 = [[wrap_phase(v) for v in row] for row in truth1]
+    f2 = [[wrap_phase(v) for v in row] for row in truth2]
+    mm1 = [[True] * wd for _ in range(h)]
+    mm2 = [[True] * wd for _ in range(h)]
+    mm1[2][3] = False  # 帧1局部缺测
+    mm2[0][0] = False  # 帧2锚点缺测 => 帧2改从 (0,1) 起展开
+    n_common = sum(1 for r in range(h) for c in range(wd)
+                   if mm1[r][c] and mm2[r][c])
+
+    al = align_frame_pair(f1, mm1, f2, mm2)
+    print(f"共同有效像素数    : {len(al.common_pixels)}（手算 {n_common}）")
+    print(f"是否对齐          : {al.aligned}")
+    # 手算：帧1锚点 (0,0) 展开 φ1(0,1)=2.5；帧2锚点缺 (0,0) 改从 (0,1)
+    # 起展开，φ2(0,1)=wrap(2.5-4)=wrap(-1.5)=-1.5。同梯度 => 共同像素上
+    # d=φ1-φ2 恒为 2.5-(-1.5)=4.0 => K=round(4/2π)=1。
+    print("全局整数周偏移 K  : "
+          f"{al.offset_cycles}（手算：φ1(0,1)=2.5、φ2(0,1)=-1.5，"
+          "d 恒为 4.0，round(4/2π)=1）")
+    per = 4.0 - al.offset_cycles * TWO_PI
+    print(f"对齐后逐像素残差  : 恒为 {per:+.6f} rad = 4 − 2π")
+    print(f"最小平方差 SSE    : {al.sse:.6f}（手算 {n_common}·({per:.6f})² "
+          f"= {n_common * per * per:.6f}；K=0 时为 {n_common * 16.0:.1f}）")
+    # 帧1独有像素 (2,3) 不参与 K 的选择，但帧2该像素有效，仍被整体平移。
+    v = al.aligned_frame2[2][3] - al.frame2.unwrapped[2][3]
+    print(f"帧1缺测像素 (2,3) : 不参与选择；帧2该处仍整体平移 "
+          f"{v / TWO_PI:+.0f}·2π = {v:+.6f} rad")
+    # 抽一个共同像素展示包裹->展开->对齐的全过程。
+    r, c = 0, 1
+    print(f"抽样像素 (0,1)    : 包裹=({f1[r][c]:+.4f},{f2[r][c]:+.4f}) "
+          f"展开=({al.frame1.unwrapped[r][c]:+.4f},"
+          f"{al.frame2.unwrapped[r][c]:+.4f}) "
+          f"对齐后帧2={al.aligned_frame2[r][c]:+.4f}（帧1差 "
+          f"{al.aligned_frame2[r][c] - al.frame1.unwrapped[r][c]:+.4f}）")
+
+    # --- 5. 边界：无任何共同像素 => 未对齐，保留掩码与两帧结果 -------------
+    section("5. 帧对齐边界：掩码棋盘互补、无共同像素 —— 返回未对齐")
+    h = w = 4
+    gg = [[wrap_phase(0.1 * r + 0.2 * c) for c in range(w)] for r in range(h)]
+    cc1 = [[(r + c) % 2 == 0 for c in range(w)] for r in range(h)]
+    cc2 = [[(r + c) % 2 == 1 for c in range(w)] for r in range(h)]
+    alu = align_frame_pair(gg, cc1, gg, cc2)
+    print(f"  aligned={alu.aligned}，K={alu.offset_cycles}，"
+          f"SSE={alu.sse}，共同像素={len(alu.common_pixels)}")
+    print(f"  两帧展开结果仍保留：帧1区数={len(alu.frame1.regions)}，"
+          f"帧2区数={len(alu.frame2.regions)}；掩码未被修改。")
+    print(f"  aligned_frame2 退化为帧2自身展开："
+          f"{alu.aligned_frame2 == alu.frame2.unwrapped}")
+
+    # --- 6. 实际错误：帧2形状不一致，明确拒绝、无半更新 --------------------
+    section("6. 帧对齐错误：两帧形状不一致 —— InvalidPhaseInputError")
+    bad2 = [[wrap_phase(0.1 * c) for c in range(7)] for _ in range(4)]
+    badm2 = [[True] * 7 for _ in range(4)]
+    try:
+        align_frame_pair(f1, mm1, bad2, badm2)
+    except InvalidPhaseInputError as exc:
+        print(f"  实际捕获 {type(exc).__name__}: {exc}")
+    print("  时间对齐只在同形帧间定义；此调用不产生任何结果对象，"
+          "输入列表不被修改。")
 
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 68)

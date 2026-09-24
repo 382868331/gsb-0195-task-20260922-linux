@@ -12,6 +12,11 @@
 5. 对所有非切口有效边做一致性复核，矛盾以 unmet_edges 如实输出，
    不用平滑结果掩盖。
 
+另提供 align_frame_pair：相邻两帧各自独立做上述空间展开后，在两帧
+共同有效像素上枚举一个全局整数周偏移 K 使平方差最小（并列取较小
+整数）；无共同像素时返回 aligned=False 的未对齐状态，保留两帧结果
+与掩码。
+
 接口与错误语义见模块 README。
 """
 
@@ -26,12 +31,14 @@ __all__ = [
     "TWO_PI",
     "RESIDUE_TOLERANCE",
     "UNWRAP_TOLERANCE",
+    "ALIGNMENT_SSE_TOLERANCE",
     "DEFAULT_SEARCH_BUDGET",
     "Residue",
     "CutEdge",
     "UnmetEdge",
     "Region",
     "UnwrapResult",
+    "FrameAlignment",
     "PhaseCutError",
     "InvalidPhaseInputError",
     "SearchBudgetExhausted",
@@ -39,6 +46,7 @@ __all__ = [
     "UnwrappingContradictionError",
     "wrap_phase",
     "unwrap_phase",
+    "align_frame_pair",
 ]
 
 MAX_SIZE = 32
@@ -49,6 +57,10 @@ PI = math.pi
 # 1e-9 是留有千倍余量的严格口径，不是用来掩盖边界错误的宽容差。
 RESIDUE_TOLERANCE = 1e-9
 UNWRAP_TOLERANCE = 1e-9
+# 相邻两帧 SSE(K) 与 SSE(K+1) 判为“并列”的口径（rad²）。
+# SSE 之差恰好为 0（浮点精确相等）才算并列；这里只留极小的数值噪声余量，
+# 量级远小于单个共同像素上 (2π·(2d+2π)) 的典型贡献（>~10 rad²）。
+ALIGNMENT_SSE_TOLERANCE = 1e-9
 DEFAULT_SEARCH_BUDGET = 1_000_000
 
 # 固定的四方向字典序：北、东、南、西。BFS 首次访问序由此唯一确定，
@@ -118,6 +130,31 @@ class UnwrapResult(NamedTuple):
     #: 与输入同形的展开相位；无效像素位置为 None。
     unwrapped: tuple[tuple[Optional[float], ...], ...]
     unmet_edges: tuple[UnmetEdge, ...]
+
+
+class FrameAlignment(NamedTuple):
+    """相邻两帧在共同有效像素上的全局整数周对齐结果。
+
+    aligned: 是否成功对齐（两帧至少有一个共同有效像素）。
+    offset_cycles: 对齐成功时第二帧相对第一帧的全局整数周偏移 K，
+        aligned 第二帧 = frame2 展开值 + 2π·K；未对齐时为 None。
+    common_pixels: 两帧 mask 均为 True 的像素坐标，按字典序排列。
+    sse: 对齐成功时共同像素上的最小平方差
+        Σ(φ1 − (φ2 + 2π·K))²（rad²）；未对齐时为 None。
+    frame1 / frame2: 两帧各自的残差切口展开结果（UnwrapResult），
+        无论是否对齐都会完整保留；mask 不被修改。
+    aligned_frame2: 与帧同形的嵌套元组：对齐成功时为 frame2 展开值
+        加 2π·K 的结果，未对齐时等于 frame2.unwrapped；
+        任一帧无效像素位置为 None。
+    """
+
+    aligned: bool
+    offset_cycles: Optional[int]
+    common_pixels: tuple[tuple[int, int], ...]
+    sse: Optional[float]
+    frame1: UnwrapResult
+    frame2: UnwrapResult
+    aligned_frame2: tuple[tuple[Optional[float], ...], ...]
 
 
 # --------------------------------------------------------------------------
@@ -522,4 +559,103 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         regions=tuple(regions_out),
         unwrapped=grid,
         unmet_edges=tuple(unmet),
+    )
+
+
+# --------------------------------------------------------------------------
+# 相邻两帧时间对齐
+# --------------------------------------------------------------------------
+def align_frame_pair(
+    phase1,
+    mask1,
+    phase2,
+    mask2,
+    *,
+    search_budget: int = DEFAULT_SEARCH_BUDGET,
+) -> FrameAlignment:
+    """相邻两帧的全局整数周对齐（纯函数：不修改任何输入）。
+
+    流程：两帧各自独立做残差切口展开（旧空间展开，契约不变），再在两帧
+    mask 均为 True 的共同有效像素上，选一个**全局整数周偏移 K** 使
+        SSE(K) = Σ_{共同像素} (φ1 − (φ2 + 2π·K))²
+    最小；K 并列时取较小整数。没有任何共同像素时返回 aligned=False 的
+    未对齐状态（两帧展开结果与掩码信息仍完整保留）。
+
+    非法输入抛 InvalidPhaseInputError；任一帧空间展开失败时（预算耗尽、
+    证明无解、环矛盾）原异常直接传播，不返回半对齐结果。
+    """
+    # 先完整校验两帧（_validate 不修改输入）；两帧形状必须一致，
+    # 否则“同坐标像素跨帧对应”没有定义。
+    w1, m1, h1, wd1 = _validate(phase1, mask1, search_budget)
+    w2, m2, h2, wd2 = _validate(phase2, mask2, search_budget)
+    if (h2, wd2) != (h1, wd1):
+        raise InvalidPhaseInputError(
+            f"frame shape {(h2, wd2)} != frame1 shape {(h1, wd1)}; "
+            "temporal alignment requires identical shapes"
+        )
+
+    # 两帧各自独立展开；任一帧失败即整体失败（结果尚未构造，无半更新）。
+    result1 = unwrap_phase(w1, m1, search_budget=search_budget)
+    result2 = unwrap_phase(w2, m2, search_budget=search_budget)
+
+    phi1 = result1.unwrapped
+    phi2 = result2.unwrapped
+    common = tuple(
+        (r, c)
+        for r in range(h1)
+        for c in range(wd1)
+        if m1[r][c] and m2[r][c]
+    )
+
+    base_grid = tuple(
+        tuple(phi2[r][c] for c in range(wd1)) for r in range(h1)
+    )
+    if not common:
+        return FrameAlignment(
+            aligned=False,
+            offset_cycles=None,
+            common_pixels=(),
+            sse=None,
+            frame1=result1,
+            frame2=result2,
+            aligned_frame2=base_grid,
+        )
+
+    # d = φ1 − φ2（共同像素）。单像素最优 K 为 round(d/2π)，全局单一 K
+    # 的最优解必落在这些逐像素最优值的范围内；两端各留 1 周余量即可
+    # 完整枚举，规模 ≤32×32，无需额外性能结构。
+    diffs = [phi1[r][c] - phi2[r][c] for (r, c) in common]
+    k_lo = math.floor(min(diffs) / TWO_PI - 0.5) - 1
+    k_hi = math.floor(max(diffs) / TWO_PI + 0.5) + 1
+
+    def sse(k: int) -> float:
+        shift = k * TWO_PI
+        return sum((d - shift) * (d - shift) for d in diffs)
+
+    # K 升序枚举：仅当严格更小（超过并列口径）才替换，
+    # 因此并列（SSE 差 ≤ ALIGNMENT_SSE_TOLERANCE）时保留较小整数。
+    best_k = k_lo
+    best_sse = sse(k_lo)
+    for k in range(k_lo + 1, k_hi + 1):
+        value = sse(k)
+        if value < best_sse - ALIGNMENT_SSE_TOLERANCE:
+            best_k = k
+            best_sse = value
+
+    shift = best_k * TWO_PI
+    aligned_grid = tuple(
+        tuple(
+            (phi2[r][c] + shift) if m2[r][c] else None
+            for c in range(wd1)
+        )
+        for r in range(h1)
+    )
+    return FrameAlignment(
+        aligned=True,
+        offset_cycles=best_k,
+        common_pixels=common,
+        sse=best_sse,
+        frame1=result1,
+        frame2=result2,
+        aligned_frame2=aligned_grid,
     )
