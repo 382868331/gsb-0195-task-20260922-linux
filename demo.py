@@ -6,7 +6,9 @@
 1. 无涡旋斜坡（频繁跨 pi 包裹）：无残差、无切口、单区精确还原。
 2. 单涡旋参考（解析 atan2 场）：对比“不加切口的朴素洪泛”与加切口后的
    环路误差——前者在涡核环留下约 2π 的矛盾，后者非切口边全部一致。
-3. 实际触发的边界：NaN 输入被带坐标拒绝；孤岛涡旋证明无解；
+3. 像素可靠度（边权 = 1 + 两端可靠度之和）：低可靠度走廊把切口从
+   高可靠区改道到走廊内，全 0 可靠度与不传参数结果完全一致。
+4. 实际触发的边界：NaN 输入被带坐标拒绝；孤岛涡旋证明无解；
    搜索预算耗尽与无解明确区分。
 """
 
@@ -14,6 +16,7 @@ import math
 import time
 
 from phasecut import (
+    CutEdge,
     InvalidPhaseInputError,
     NoSolutionError,
     SearchBudgetExhausted,
@@ -23,6 +26,69 @@ from phasecut import (
 )
 
 PI = math.pi
+
+
+def analytic_demo_vortices(h, w, specs):
+    """演示用确定性多涡旋场：Phi = Σ s·atan2(...) 后包裹（独立于核心）。"""
+    grid = [[0.0] * w for _ in range(h)]
+    for r in range(h):
+        for c in range(w):
+            v = 0.0
+            for (R, C), s in specs.items():
+                v += s * math.atan2(r - (R + 0.5), c - (C + 0.5))
+            grid[r][c] = wrap_phase(v)
+    return grid
+
+
+def demo_flood_check(wrapped, mask, cuts):
+    """演示用独立洪泛复核，返回 (区数, 矛盾边列表)。"""
+    h, wd = len(mask), len(mask[0])
+    phi = {}
+    regions = 0
+    blocked = set(cuts)
+    for r0 in range(h):
+        for c0 in range(wd):
+            start = (r0, c0)
+            if not mask[r0][c0] or start in phi:
+                continue
+            regions += 1
+            phi[start] = wrapped[r0][c0]
+            stack = [start]
+            while stack:
+                r, c = stack.pop()
+                for dr, dc in ((-1, 0), (0, 1), (1, 0), (0, -1)):
+                    nr, nc = r + dr, c + dc
+                    nxt = (nr, nc)
+                    if nxt in phi or not (0 <= nr < h and 0 <= nc < wd) \
+                            or not mask[nr][nc]:
+                        continue
+                    a, b = sorted(((r, c), nxt))
+                    if CutEdge(a[0], a[1], b[0], b[1]) in blocked:
+                        continue
+                    d = wrap_phase(wrapped[nr][nc] - wrapped[r][c])
+                    expect = phi[(r, c)] + d
+                    k = int(math.floor(abs((expect - wrapped[nr][nc]) / TWO_PI) + 0.5))
+                    k = k if expect - wrapped[nr][nc] >= 0 else -k
+                    phi[nxt] = wrapped[nr][nc] + k * TWO_PI
+                    stack.append(nxt)
+    bad = []
+    for r in range(h):
+        for c in range(wd):
+            if not mask[r][c]:
+                continue
+            for dr, dc in ((0, 1), (1, 0)):
+                nr, nc = r + dr, c + dc
+                if nr >= h or nc >= wd or not mask[nr][nc]:
+                    continue
+                a, b = sorted(((r, c), (nr, nc)))
+                if CutEdge(a[0], a[1], b[0], b[1]) in blocked:
+                    continue
+                residual = phi[(nr, nc)] - phi[(r, c)] - wrap_phase(
+                    wrapped[nr][nc] - wrapped[r][c]
+                )
+                if abs(residual) > 1e-9:
+                    bad.append((a, b, residual))
+    return regions, bad
 
 
 def naive_flood_edge_residuals(wrapped, mask):
@@ -174,7 +240,46 @@ def main():
           "而不是被平滑结果掩盖。")
 
     # --- 3a. 实际触发：NaN 输入被带坐标拒绝 -------------------------------
-    section("3a. 异常边界：NaN 输入必须被拒绝（可定位、不静默纠正）")
+    # --- 4. 像素可靠度改道演示 -------------------------------------------
+    section("4. 像素可靠度：低可靠度走廊引导切口（边权 = 1 + 两端可靠度之和）")
+    h = w = 9
+    gw = analytic_demo_vortices(h, w, {(1, 1): +1, (1, 7): -1})
+    mw = [[True] * w for _ in range(h)]
+    # 第 3、4 行可靠度为 0（低可靠走廊），其余像素可靠度为 2。
+    rel = [
+        [0.0 if r in (3, 4) else 2.0 for c in range(w)]
+        for r in range(h)
+    ]
+    base = unwrap_phase(gw, mw)
+    weighted = unwrap_phase(gw, mw, reliability=rel)
+    zero = unwrap_phase(gw, mw, reliability=[[0.0] * w for _ in range(h)])
+
+    def cut_weight(cuts, rel):
+        return sum(
+            1.0 + rel[e.row1][e.col1] + rel[e.row2][e.col2] for e in cuts
+        )
+
+    print(f"残差: {[(x.row, x.col, x.charge) for x in weighted.residues]}")
+    print(f"单位权切口边数        : {len(base.cuts)}（直线，全走高可靠区）")
+    print(f"  布设: {[str(e) for e in base.cuts]}")
+    print(f"  该布设按可靠度计的总代价: {cut_weight(base.cuts, rel):.1f}")
+    print(f"加权最短路切口边数    : {len(weighted.cuts)}（绕行低可靠走廊）")
+    print(f"  布设: {[str(e) for e in weighted.cuts]}")
+    print(f"  总代价: {cut_weight(weighted.cuts, rel):.1f} "
+          f"（不高于单位权布设的代价）")
+    assert cut_weight(weighted.cuts, rel) <= cut_weight(base.cuts, rel) + 1e-12
+    corridor_rows = (
+        {e.row1 for e in weighted.cuts} | {e.row2 for e in weighted.cuts}
+    )
+    print(f"  切口触及行          : {sorted(corridor_rows)}（含走廊行 3、4）")
+    _regions, bad = demo_flood_check(gw, mw, weighted.cuts)
+    print(f"  逐边复核矛盾边数    : {len(bad)}（加权不改变切口禁令，"
+          f"闭环残差不被忽略）")
+    print(f"  unmet_edges         : {len(weighted.unmet_edges)}")
+    print(f"全 0 可靠度 == 不传参数 的切口: {zero.cuts == base.cuts}（退化为曼哈顿）")
+
+    # --- 4a. 实际触发：NaN 输入被带坐标拒绝 ------------------------------
+    section("4a. 异常边界：NaN 输入必须被拒绝（可定位、不静默纠正）")
     bad_phase = [[0.1 * c for c in range(5)] for _ in range(5)]
     bad_phase[3][2] = float("nan")
     try:
@@ -183,8 +288,8 @@ def main():
         print(f"  实际捕获 {type(exc).__name__}: {exc}")
         print(f"  定位 row={exc.row}, col={exc.col}")
 
-    # --- 3b. 实际触发：孤岛涡旋 = 证明无解 --------------------------------
-    section("3b. 异常边界：无效海孤岛内的单个涡旋 —— 证明无解")
+    # --- 4b. 实际触发：孤岛涡旋 = 证明无解 -------------------------------
+    section("4b. 异常边界：无效海孤岛内的单个涡旋 —— 证明无解")
     h = w = 11
     island = [[False] * w for _ in range(h)]
     for r in range(4, 7):
@@ -204,8 +309,8 @@ def main():
         print(f"  实际捕获 {type(exc).__name__}")
         print(f"  信息: {exc}")
 
-    # --- 3c. 实际触发：预算耗尽 ≠ 无解 ------------------------------------
-    section("3c. 异常边界：搜索预算耗尽（与“证明无解”严格区分）")
+    # --- 4c. 实际触发：预算耗尽 ≠ 无解 -----------------------------------
+    section("4c. 异常边界：搜索预算耗尽（与“证明无解”严格区分）")
     g2 = [
         [wrap_phase(math.atan2(r - 4.5, c - 4.5)) for c in range(9)]
         for r in range(9)

@@ -4,9 +4,12 @@
 
 1. 对每个四点全有效的 2×2 环路，用包裹到 [-pi, pi) 的邻差求和，
    四舍五入到最近整数得到整数残差电荷（典型为 -1/0/+1）。
-2. 残差按 (row, col) 字典序处理：每个未配对残差在对偶格点图上 BFS，
-   找曼哈顿距离最短的异号残差配对，等距时取字典序最小者；
-   配不上的剩余残差各自走最短有效路径到图像外边界。
+2. 残差按 (row, col) 字典序处理：每个未配对残差在对偶格点图上做
+   非负权 Dijkstra，找路径代价最小的异号残差配对，同代价取目标坐标
+   字典序最小者，同代价路径取方向序（北东南西）字典序最小者；
+   配不上的剩余残差各自走最小代价有效路径到图像外边界。
+   边权 = 1 + 两端像素可靠度之和（不传可靠度时退化为单位权，
+   即原曼哈顿最短路语义）。
 3. 路径跨过的像素邻接边置为切口，洪泛积分时不可跨越。
 4. 每个切口连通区从字典序最小像素起洪凡展开，锚点整数偏移基准为 0。
 5. 对所有非切口有效边做一致性复核，矛盾以 unmet_edges 如实输出，
@@ -18,7 +21,7 @@
 from __future__ import annotations
 
 import math
-from collections import deque
+import heapq
 from typing import NamedTuple, Optional
 
 __all__ = [
@@ -27,6 +30,7 @@ __all__ = [
     "RESIDUE_TOLERANCE",
     "UNWRAP_TOLERANCE",
     "DEFAULT_SEARCH_BUDGET",
+    "EDGE_BASE_WEIGHT",
     "Residue",
     "CutEdge",
     "UnmetEdge",
@@ -50,6 +54,9 @@ PI = math.pi
 RESIDUE_TOLERANCE = 1e-9
 UNWRAP_TOLERANCE = 1e-9
 DEFAULT_SEARCH_BUDGET = 1_000_000
+# 每条对偶步的基准边权：总边权 = 基准 + 两端像素可靠度之和。
+# 基准为 1 保证即使可靠度全为 0，权重也仍等价于曼哈顿步数。
+EDGE_BASE_WEIGHT = 1.0
 
 # 固定的四方向字典序：北、东、南、西。BFS 首次访问序由此唯一确定，
 # 从而等距路径也是确定性的。
@@ -190,7 +197,17 @@ def _canonical_edge(a: tuple[int, int], b: tuple[int, int]) -> CutEdge:
 # --------------------------------------------------------------------------
 # 输入校验
 # --------------------------------------------------------------------------
-def _validate(phase, mask, search_budget: int):
+def _edge_weight(a, b, rel) -> float:
+    """对偶步跨过像素边 a-b 的非负代价：1 + 两端像素可靠度之和。
+
+    rel 为 None 时所有像素可靠度视为 0，每条边权恒为 1（原曼哈顿语义）。
+    """
+    if rel is None:
+        return 1.0
+    return EDGE_BASE_WEIGHT + rel[a[0]][a[1]] + rel[b[0]][b[1]]
+
+
+def _validate(phase, mask, search_budget: int, reliability=None):
     if not isinstance(search_budget, int) or isinstance(search_budget, bool):
         raise InvalidPhaseInputError(
             "search_budget must be an int; bool is not accepted"
@@ -271,8 +288,54 @@ def _validate(phase, mask, search_budget: int):
         p_grid.append(p_out)
         m_grid.append(m_out)
 
+    if reliability is not None:
+        if (
+            isinstance(reliability, (str, bytes))
+            or not isinstance(reliability, (list, tuple))
+        ):
+            raise InvalidPhaseInputError(
+                "reliability must be a sequence of numeric rows"
+            )
+        if len(reliability) != height:
+            raise InvalidPhaseInputError(
+                f"reliability has {len(reliability)} rows but phase has {height}"
+            )
+        r_out: list[list[float]] = []
+        for r, rrow in enumerate(reliability):
+            if (
+                isinstance(rrow, (str, bytes))
+                or not isinstance(rrow, (list, tuple))
+            ):
+                raise InvalidPhaseInputError(
+                    "reliability row must be a sequence", row=r
+                )
+            if len(rrow) != width:
+                raise InvalidPhaseInputError(
+                    f"reliability row length {len(rrow)} != {width}", row=r
+                )
+            row_out: list[float] = []
+            for c, rv in enumerate(rrow):
+                if isinstance(rv, bool) or not isinstance(rv, (int, float)):
+                    raise InvalidPhaseInputError(
+                        "reliability value must be a real int/float "
+                        "(bool, complex, str rejected)",
+                        row=r,
+                        col=c,
+                    )
+                frv = float(rv)
+                if math.isnan(frv) or math.isinf(frv) or frv < 0.0:
+                    raise InvalidPhaseInputError(
+                        "reliability value must be finite and >= 0 "
+                        "(NaN/Infinity/negative rejected)",
+                        row=r,
+                        col=c,
+                    )
+                row_out.append(frv)
+            r_out.append(row_out)
+        reliability = r_out
+
     assert width is not None
-    return p_grid, m_grid, height, width
+    return p_grid, m_grid, height, width, reliability
 
 
 # --------------------------------------------------------------------------
@@ -341,32 +404,59 @@ def _dual_moves(cell, mask, height, width):
     return moves
 
 
-def _dual_bfs(start, mask, height, width, budget: int):
-    """从残差格做完整 BFS，返回 (dist, parent_edge, used)。
+def _dual_dijkstra(start, mask, height, width, budget: int, rel):
+    """从残差格做完整非负权最短路，返回 (cost, parent, used)。
 
-    parent_edge[cell] = (上一单元格, 跨过的 CutEdge)；起点为 None。
-    超出 budget 抛 SearchBudgetExhausted（结果丢弃，不产生部分切口）。
+    对偶步跨过像素边 a-b 的代价为 1 + rel[a]+rel[b]（rel=None 时恒为 1，
+    即原单位权 BFS）。代价相等时按方向序（北东南西 = 0,1,2,3）选择
+    字典序最小的路径方向序列：单位权情形下这与原 BFS 固定邻接序首次
+    到达给出的路径完全一致，因此不传可靠度时结果不变。
+
+    parent[cell] = (上一单元格, 跨过的 CutEdge)；起点为 None。
+    新访问格点数达到 budget 仍未跑完时抛 SearchBudgetExhausted
+    （结果丢弃，不产生部分切口）。
     """
-    dist = {start: 0}
+    cost = {start: 0.0}
+    route_key = {start: ()}  # 从起点到该格的方向序列（仅用于同代价决胜）
     parent: dict[tuple[int, int], Optional[tuple[tuple[int, int], CutEdge]]] = {
         start: None
     }
-    queue = deque([start])
+    # 堆元素 (代价, 方向序列, 格点)；方向序列按北东南西 0..3 编码，
+    # 元组字典序天然给出同代价路径的确定性决胜。
+    heap: list[tuple[float, tuple[int, ...], tuple[int, int]]] = [
+        (0.0, (), start)
+    ]
     used = 1
-    while queue:
-        cell = queue.popleft()
-        for nxt, edge_px, _dir in _dual_moves(cell, mask, height, width):
-            if nxt is None or nxt in dist:
+    while heap:
+        cur_cost, cur_key, cell = heapq.heappop(heap)
+        if cur_cost != cost[cell]:
+            continue  # 旧的松弛条目，已被更优/同代价更小路径取代
+        if cur_key != route_key[cell]:
+            continue  # 同代价但方向序更劣的旧条目。
+        for nxt, edge_px, dir_idx in _dual_moves(cell, mask, height, width):
+            if nxt is None:
                 continue
-            if used >= budget:
-                raise SearchBudgetExhausted(
-                    f"dual-graph BFS node budget {budget} exhausted from residue {start}"
-                )
-            used += 1
-            dist[nxt] = dist[cell] + 1
+            weight = _edge_weight(edge_px[0], edge_px[1], rel)
+            new_cost = cur_cost + weight
+            new_key = cur_key + (dir_idx,)
+            old_cost = cost.get(nxt)
+            if old_cost is not None:
+                if new_cost > old_cost or (
+                    new_cost == old_cost and new_key >= route_key[nxt]
+                ):
+                    continue
+            else:
+                if used >= budget:
+                    raise SearchBudgetExhausted(
+                        f"dual-graph shortest-path node budget {budget} exhausted "
+                        f"from residue {start}"
+                    )
+                used += 1
+            cost[nxt] = new_cost
+            route_key[nxt] = new_key
             parent[nxt] = (cell, _canonical_edge(*edge_px))
-            queue.append(nxt)
-    return dist, parent, used
+            heapq.heappush(heap, (new_cost, new_key, nxt))
+    return cost, parent, used
 
 
 def _reconstruct(parent, target) -> list[CutEdge]:
@@ -387,21 +477,31 @@ def _border_path(parent, exit_cell, exit_edge: CutEdge) -> list[CutEdge]:
 # --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
-def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> UnwrapResult:
+def unwrap_phase(
+    phase,
+    mask,
+    *,
+    search_budget: int = DEFAULT_SEARCH_BUDGET,
+    reliability=None,
+) -> UnwrapResult:
     """残差切口相位展开（纯函数：不修改 phase/mask）。
 
     非法输入抛 InvalidPhaseInputError（带 row/col）；搜索预算耗尽抛
     SearchBudgetExhausted；剩余残差证明无法到达外边界抛 NoSolutionError；
     环和不是 2π 整数倍抛 UnwrappingContradictionError。
+
+    reliability 为 None 或与 phase 同形的非负有限数值网格：每条对偶步
+    （像素边 a-b）的边权 = 1 + reliability[a] + reliability[b]。残差计算、
+    电荷处理顺序与洪泛/复核均不依赖可靠度；None 或全 0 时边权恒为 1。
     """
-    w, m, height, width = _validate(phase, mask, search_budget)
+    w, m, height, width, rel = _validate(phase, mask, search_budget, reliability)
 
     residues, charges = _compute_residues(w, m, height, width)
 
     cuts: set[CutEdge] = set()
     unpaired: set[tuple[int, int]] = {(res.row, res.col) for res in residues}
 
-    # ---- 第一遍：字典序贪心，异号最短曼哈顿配对 --------------------------
+    # ---- 第一遍：字典序贪心，异号最小代价配对 --------------------------
     # 先处理的残差若当时没有可达的异号对象，会自然留在 unpaired 中；
     # 之后处理到的异号残差做 BFS 时仍可把它配走（无向图，可达对称）。
     for res in residues:
@@ -411,8 +511,10 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         targets = [p for p in unpaired if p != src and charges[p] == -charges[src]]
         if not targets:
             continue
-        dist, parent, _used = _dual_bfs(src, m, height, width, search_budget)
-        reachable = [(dist[p], p) for p in targets if p in dist]
+        cost, parent, _used = _dual_dijkstra(
+            src, m, height, width, search_budget, rel
+        )
+        reachable = [(cost[p], p) for p in targets if p in cost]
         if not reachable:
             continue
         reachable.sort(key=lambda t: (t[0], t[1]))
@@ -424,18 +526,24 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
 
     # ---- 第二遍：剩余残差（按字典序）各自连到外边界 ----------------------
     for src in sorted(unpaired):
-        dist, parent, _used = _dual_bfs(src, m, height, width, search_budget)
+        cost, parent, _used = _dual_dijkstra(
+            src, m, height, width, search_budget, rel
+        )
         best = None  # (总长, 出口格字典序, 方向序, 路径)
-        for cell, d in dist.items():
+        for cell, d in cost.items():
             r, c = cell
             for nxt, edge_px, dir_idx in _dual_moves(cell, m, height, width):
                 if nxt is not None:
                     continue  # 仅 nxt is None 表示这一步直接跨出图像外边界
-                key = (d + 1, cell, dir_idx)
+                exit_edge = _canonical_edge(*edge_px)
+                exit_weight = _edge_weight(
+                    exit_edge[:2], exit_edge[2:], rel
+                )
+                key = (d + exit_weight, cell, dir_idx)
                 if best is None or key < best[0]:
                     best = (
                         key,
-                        _border_path(parent, cell, _canonical_edge(*edge_px)),
+                        _border_path(parent, cell, exit_edge),
                     )
         if best is None:
             raise NoSolutionError(

@@ -67,6 +67,124 @@ def all_true(h, w):
     return [[True] * w for _ in range(h)]
 
 
+def rel_grid(h, w, value=0.0):
+    return [[float(value) for _ in range(w)] for _ in range(h)]
+
+
+def ref_edge_weight(edge, rel):
+    """独立计算对偶步跨过的像素边权：1 + 两端可靠度之和。"""
+    (r1, c1), (r2, c2) = edge
+    if rel is None:
+        return 1
+    return 1 + rel[r1][c1] + rel[r2][c2]
+
+
+def dual_neighbors(cell, mask, h, w):
+    """独立对偶邻接：(下一格 or None 表示出界, 跨过的像素边, 方向序)。"""
+    r, c = cell
+    out = []
+    edge = ((r, c), (r, c + 1))  # 北
+    if mask[r][c] and mask[r][c + 1]:
+        out.append((None if r == 0 else (r - 1, c), edge, 0))
+    edge = ((r, c + 1), (r + 1, c + 1))  # 东
+    if mask[r][c + 1] and mask[r + 1][c + 1]:
+        out.append((None if c == w - 2 else (r, c + 1), edge, 1))
+    edge = ((r + 1, c), (r + 1, c + 1))  # 南
+    if mask[r + 1][c] and mask[r + 1][c + 1]:
+        out.append((None if r == h - 2 else (r + 1, c), edge, 2))
+    edge = ((r, c), (r + 1, c))  # 西
+    if mask[r][c] and mask[r + 1][c]:
+        out.append((None if c == 0 else (r, c - 1), edge, 3))
+    return out
+
+
+def ref_weighted_shortest(start, targets, mask, h, w, rel):
+    """独立非负权最短路：返回 (最优目标, 代价, 路径像素边列表)。
+
+    目标选择：最小代价，再目标坐标字典序；同代价路径取方向序列
+    （北东南西 0..3）字典序最小。完全独立于 phasecut 的实现。
+    targets 为 None 时表示“出界”这一虚拟目标。
+    """
+    import heapq
+
+    costs = {start: 0}
+    keys = {start: ()}
+    parents = {start: None}  # (上一格, 像素边)
+    heap = [(0, (), start)]
+    best_exit = None  # 虚拟出界目标：(代价, key, 路径)
+    while heap:
+        d, key, cell = heapq.heappop(heap)
+        if d != costs[cell] or key != keys[cell]:
+            continue
+        for nxt, edge, di in dual_neighbors(cell, mask, h, w):
+            nd = d + ref_edge_weight(edge, rel)
+            nk = key + (di,)
+            if nxt is None:
+                if best_exit is None or (nd, nk) < (best_exit[0], best_exit[1]):
+                    path = []
+                    cur = cell
+                    while parents[cur] is not None:
+                        prev, e = parents[cur]
+                        path.append(e)
+                        cur = prev
+                    path.reverse()
+                    path.append(edge)
+                    best_exit = (nd, nk, path)
+                continue
+            if nxt not in costs or nd < costs[nxt] or (
+                nd == costs[nxt] and nk < keys[nxt]
+            ):
+                costs[nxt] = nd
+                keys[nxt] = nk
+                parents[nxt] = (cell, edge)
+                heapq.heappush(heap, (nd, nk, nxt))
+    if targets is None:
+        return best_exit
+    choices = []
+    for t in targets:
+        if t in costs:
+            choices.append((costs[t], t))
+    if not choices:
+        return None
+    _, tgt = min(choices, key=lambda x: (x[0], x[1]))
+    path = []
+    cur = tgt
+    while parents[cur] is not None:
+        prev, e = parents[cur]
+        path.append(e)
+        cur = prev
+    path.reverse()
+    return tgt, costs[tgt], path
+
+
+def enumerate_simple_pair_paths(start, target, mask, h, w, rel, limit=200000):
+    """暴力枚举 start->target 的所有简单对偶路径，返回 (边集合, 代价) 列表。"""
+    found = []
+    count = 0
+
+    def walk(cell, visited, edges, cost):
+        nonlocal count
+        if cell == target:
+            found.append((frozenset(
+                tuple(sorted((a, b))) for a, b in edges
+            ), cost))
+            return
+        for nxt, edge, _di in dual_neighbors(cell, mask, h, w):
+            if nxt is None or nxt in visited:
+                continue
+            count += 1
+            if count > limit:
+                raise RuntimeError("enumeration limit exceeded")
+            visited.add(nxt)
+            edges.append(edge)
+            walk(nxt, visited, edges, cost + ref_edge_weight(edge, rel))
+            edges.pop()
+            visited.remove(nxt)
+
+    walk(start, {start}, [], 0)
+    return found
+
+
 def analytic_vortices(h, w, specs):
     """独立测试数据生成器：在指定环角点放置整数涡旋电荷。
 
@@ -814,6 +932,261 @@ class TestContradictionContract(unittest.TestCase):
         exc = UnwrappingContradictionError(2, 3, 0.7)
         self.assertEqual((exc.row, exc.col, exc.loop_sum), (2, 3, 0.7))
         self.assertIsInstance(exc, phasecut.PhaseCutError)
+
+
+class TestReliability(unittest.TestCase):
+    """像素可靠度对切口选择的影响（边权 = 1 + 两端可靠度之和）。"""
+
+    def test_reliability_validation(self):
+        g = [[0.1 * c for c in range(3)] for _ in range(3)]
+        m = all_true(3, 3)
+        # 结构错误。
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, m, reliability=[[0.0] * 3 for _ in range(2)])
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, m, reliability=[[0.0] * 2 for _ in range(3)])
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, m, reliability="000000000")
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, m, reliability=["abc"] * 3)
+        # 数值错误：负、NaN、inf、bool（带定位）。
+        for bad in (-0.01, float("nan"), float("inf"), float("-inf"), True):
+            rel = rel_grid(3, 3)
+            rel[1][2] = bad
+            with self.assertRaises(InvalidPhaseInputError) as cm:
+                unwrap_phase(g, m, reliability=rel)
+            self.assertEqual((cm.exception.row, cm.exception.col), (1, 2))
+        # 0.0 与大正数合法；纯函数不修改输入。
+        rel = rel_grid(3, 3, 1e6)
+        snapshot = [row[:] for row in rel]
+        unwrap_phase(g, m, reliability=rel)
+        self.assertEqual(rel, snapshot)
+
+    def test_low_reliability_corridor_diverts_cut(self):
+        # (1,1)+ 与 (1,5)- 同行，单位权下直连（4 步，全在高可靠区）；
+        # 第 2、3 行可靠度为 0 形成走廊，加权最短路必须绕行走低权走廊。
+        h = w = 7
+        g = analytic_vortices(h, w, {(1, 1): +1, (1, 5): -1})
+        mask = all_true(h, w)
+        self.assertEqual(ref_residues(g, mask), [(1, 1, 1), (1, 5, -1)])
+
+        unit = unwrap_phase(g, mask)
+        self.assertEqual(
+            set(unit.cuts),
+            {phasecut.CutEdge(1, c, 2, c) for c in range(2, 6)},
+        )
+
+        rel = [
+            [0.0 if r in (2, 3) else 2.0 for c in range(w)]
+            for r in range(h)
+        ]
+        weighted = unwrap_phase(g, mask, reliability=rel)
+        cutset = set(weighted.cuts)
+        # 切口不再是直线，且没有任何切口边两端都在高可靠像素上
+        # （高可靠边权 = 5；走廊行 2/3 端点可靠度为 0）。
+        self.assertNotEqual(cutset, set(unit.cuts))
+        for e in weighted.cuts:
+            endpoints = ((e.row1, e.col1), (e.row2, e.col2))
+            self.assertFalse(all(rr not in (2, 3) for rr, _ in endpoints))
+
+        # 独立加权最短路给出同一条最优配对路径。
+        _tgt, _cost, ref_path = ref_weighted_shortest(
+            (1, 1), [(1, 5)], mask, h, w, rel
+        )
+        ref_cuts = {
+            phasecut.CutEdge(*sum(map(tuple, sorted(edge)), ()))
+            for edge in ref_path
+        }
+        self.assertEqual(cutset, ref_cuts)
+
+        # 逐边独立复核：所有非切口边展开残差为 0。
+        regions, bad = independent_flood_check(g, mask, weighted.cuts)
+        self.assertEqual(bad, [])
+        self.assertEqual(regions, len(weighted.regions))
+        self.assertEqual(weighted.unmet_edges, ())
+
+    def test_all_equal_reliability_reproduces_manhattan(self):
+        # 全相等可靠度（含 0 和任意正常数）都必须退回原曼哈顿结果。
+        h = w = 9
+        g = analytic_vortices(
+            h, w, {(2, 4): +1, (2, 6): -1, (4, 4): -1}
+        )
+        mask = all_true(h, w)
+        base = unwrap_phase(g, mask)
+        for value in (0.0, 0.37, 5.0):
+            res = unwrap_phase(g, mask, reliability=rel_grid(h, w, value))
+            self.assertEqual(res.cuts, base.cuts, value)
+            self.assertEqual(res.regions, base.regions, value)
+            self.assertEqual(res.unmet_edges, ())
+
+    def test_zero_reliability_parameter_exact_match(self):
+        # 显式传全 0 可靠度与完全不传，在 200 例 fuzz 同一组网格上结果一致。
+        rng = random.Random(444001)
+        for _ in range(60):
+            h = rng.randint(2, 12)
+            w = rng.randint(2, 12)
+            mask = [[rng.random() < 0.7 for _ in range(w)] for _ in range(h)]
+            g = [[wrap_phase(rng.uniform(-PI + 1e-6, PI - 1e-6))
+                  for _ in range(w)] for _ in range(h)]
+            rel = rel_grid(h, w, 0.0)
+            try:
+                a = unwrap_phase(g, mask)
+            except NoSolutionError:
+                with self.assertRaises(NoSolutionError):
+                    unwrap_phase(g, mask, reliability=rel)
+                continue
+            b = unwrap_phase(g, mask, reliability=rel)
+            self.assertEqual(a.cuts, b.cuts)
+            self.assertEqual(a.regions, b.regions)
+            self.assertEqual(a.unmet_edges, b.unmet_edges)
+
+    def test_charge_separated_by_mask_cannot_pair(self):
+        # 无效护城河把一个 +1 电荷围在 3x3 岛内（不触图像外边界），
+        # 岛外另有一个 -1：两者无法配对；mask 洞不是默认外边界，
+        # 岛内电荷没有出口 —— 即使给它开出全 0 低权走廊也出不去。
+        h = w = 11
+        mask = [[True] * w for _ in range(h)]
+        for r in range(3, 8):
+            for c in range(3, 8):
+                if r in (3, 7) or c in (3, 7):
+                    mask[r][c] = False  # 护城河边（岛 = 4..6）
+        g = analytic_vortices(h, w, {(4, 4): +1, (1, 9): -1})
+        self.assertEqual(ref_residues(g, mask), [(1, 9, -1), (4, 4, 1)])
+        rel = rel_grid(h, w, 0.5)
+        with self.assertRaises(NoSolutionError):
+            unwrap_phase(g, mask, reliability=rel)
+        # 不传可靠度时同样无解：无解取决于几何，与权重无关。
+        with self.assertRaises(NoSolutionError):
+            unwrap_phase(g, mask)
+        # 独立复核：岛内对偶分量既不连通异号电荷、也无外边界出口。
+        inside = independent_bfs_dist((4, 4), mask, h, w)
+        self.assertNotIn((1, 9), inside)
+        self.assertFalse(any(
+            (mask[R][C] and mask[R][C + 1] and R == 0)
+            or (mask[R + 1][C] and mask[R + 1][C + 1] and R == h - 2)
+            or (mask[R][C] and mask[R + 1][C] and C == 0)
+            or (mask[R][C + 1] and mask[R + 1][C + 1] and C == w - 2)
+            for (R, C) in inside
+        ))
+
+    def test_enumerated_small_graph_optimal_cut(self):
+        # 小图暴力枚举所有简单路径：核心选出的配对路径必须达到枚举最优代价。
+        h = w = 5
+        start, target = (0, 1), (3, 1)
+        g = analytic_vortices(h, w, {start: +1, target: -1})
+        mask = all_true(h, w)
+        self.assertEqual(ref_residues(g, mask), [(0, 1, 1), (3, 1, -1)])
+        rng = random.Random(444002)
+        rel = [[rng.choice((0.0, 1.5, 4.0)) for _ in range(w)] for _ in range(h)]
+        res = unwrap_phase(g, mask, reliability=rel)
+        cutset = set(res.cuts)
+
+        all_paths = enumerate_simple_pair_paths(
+            start, target, mask, h, w, rel
+        )
+        optimum = min(cost for _edges, cost in all_paths)
+        chosen_cost = sum(
+            ref_edge_weight(
+                ((e.row1, e.col1), (e.row2, e.col2)), rel
+            ) for e in res.cuts
+        )
+        self.assertAlmostEqual(chosen_cost, optimum, places=12)
+        # 核心切口集本身必须是枚举中的一条简单路径。
+        canonical = frozenset(
+            tuple(sorted(
+                [(e.row1, e.col1), (e.row2, e.col2)]
+            ))
+            for e in res.cuts
+        )
+        self.assertIn((canonical, chosen_cost), all_paths)
+        # 独立 Dijkstra 同样给出该目标与代价。
+        tgt, cost, ref_path = ref_weighted_shortest(
+            start, [target], mask, h, w, rel
+        )
+        self.assertEqual(tgt, target)
+        self.assertAlmostEqual(cost, optimum, places=12)
+        self.assertEqual(
+            set(tuple(sorted(e)) for e in ref_path), canonical
+        )
+        regions, bad = independent_flood_check(g, mask, res.cuts)
+        self.assertEqual(bad, [])
+        self.assertEqual(regions, len(res.regions))
+
+    def test_weighted_tie_direction_order(self):
+        # 同代价路径按方向序决胜。残差按字典序处理，实际搜索从
+        # (1,3,-1) 出发到 (2,2,+1)：[南(2),西(3)] 与 [西(3),南(2)]
+        # 等长等权，方向序更小的是 [南,西]。
+        h = w = 6
+        g = analytic_vortices(h, w, {(2, 2): +1, (1, 3): -1})
+        mask = all_true(h, w)
+        self.assertEqual(ref_residues(g, mask), [(1, 3, -1), (2, 2, 1)])
+        rel = rel_grid(h, w, 0.0)  # 全 0：两条对角两步路径代价完全相同
+        res = unwrap_phase(g, mask, reliability=rel)
+        cutset = set(res.cuts)
+        # [南,西]：先跨水平边 (2,3)-(2,4)，再跨竖直边 (2,3)-(3,3)。
+        self.assertEqual(
+            cutset,
+            {phasecut.CutEdge(2, 3, 2, 4), phasecut.CutEdge(2, 3, 3, 3)},
+        )
+        _tgt, _cost, ref_path = ref_weighted_shortest(
+            (1, 3), [(2, 2)], mask, h, w, rel
+        )
+        self.assertEqual(
+            cutset,
+            {phasecut.CutEdge(*sum(map(tuple, sorted(e)), ()))
+             for e in ref_path},
+        )
+        regions, bad = independent_flood_check(g, mask, res.cuts)
+        self.assertEqual(bad, [])
+        self.assertEqual(regions, len(res.regions))
+
+    def test_weighted_random_audit(self):
+        # 带随机可靠度的小图：独立逐边复核 + 残差仍全被切口相邻，
+        # 且高可靠边被穿越的数量不高于单位权布设（走廊效应的统计性质）。
+        rng = random.Random(444003)
+        for _ in range(40):
+            h = rng.randint(3, 10)
+            w = rng.randint(3, 10)
+            mask = [[rng.random() < 0.85 for _ in range(w)] for _ in range(h)]
+            if not any(any(row) for row in mask):
+                continue
+            g = [[wrap_phase(rng.uniform(-PI + 1e-6, PI - 1e-6))
+                  for _ in range(w)] for _ in range(h)]
+            rel = [[rng.choice((0.0, 0.0, 1.0, 3.0, 8.0))
+                    for _ in range(w)] for _ in range(h)]
+            try:
+                res = unwrap_phase(g, mask, reliability=rel)
+            except NoSolutionError:
+                # 无解只取决于几何（mask），与权重无关；不传可靠度同样无解。
+                with self.assertRaises(NoSolutionError):
+                    unwrap_phase(g, mask)
+                continue
+            regions, bad = independent_flood_check(g, mask, res.cuts)
+            self.assertEqual(regions, len(res.regions))
+            # 洞卷绕/不可切口边矛盾仍须如实报告，且与独立检查完全一致，
+            # 权重不允许掩盖闭环残差。
+            self.assertEqual(
+                sorted((e.row1, e.col1, e.row2, e.col2)
+                       for e in res.unmet_edges),
+                sorted((a, b, cc, d) for a, b, cc, d, _v in bad),
+            )
+            for _a, _b, _cc, _d, v in bad:
+                self.assertLess(abs(v / TWO_PI - round(v / TWO_PI)), 1e-9)
+            for e in res.cuts:  # 所有切口边两端都是有效像素
+                self.assertTrue(
+                    mask[e.row1][e.col1] and mask[e.row2][e.col2]
+                )
+            # 闭环残差不被权重忽略：有残差则每个残差格仍邻接切口。
+            cutset = set(res.cuts)
+            for x in res.residues:
+                r, c = x.row, x.col
+                incident = {
+                    phasecut.CutEdge(r, c, r, c + 1),
+                    phasecut.CutEdge(r, c + 1, r + 1, c + 1),
+                    phasecut.CutEdge(r + 1, c, r + 1, c + 1),
+                    phasecut.CutEdge(r, c, r + 1, c),
+                }
+                self.assertTrue(incident & cutset)
 
 
 if __name__ == "__main__":
