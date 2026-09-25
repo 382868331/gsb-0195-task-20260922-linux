@@ -5,13 +5,14 @@
 - 残差环和用显式四点 atan2 包裹差独立求和；
 - 指定电荷的测试场由解析多涡旋场 Phi=Σ s·atan2(...) 包裹生成，
   并由 ref_residues 逐环独立核验实际电荷（不预设生成即正确）；
-- 最短路径/等距选择用测试内独立 BFS 复核；
+- 无权最短路径用独立 BFS 复核，加权路径在小图枚举所有简单路径复核；
 - 切口分区、洪泛一致性用独立拓扑/边校验复核。
 不通过调用被测核心来得到期望值；往返一致仅作补充断言。
 """
 
 import math
 import random
+import sys
 import unittest
 from collections import deque
 
@@ -111,6 +112,50 @@ def independent_bfs_dist(start, mask, h, w):
                 dist[cell] = dist[(r, c)] + 1
                 q.append(cell)
     return dist
+
+
+def dual_move_edge(cell, direction, h, w):
+    r, c = cell
+    if direction == 0:
+        return (r, c), (r, c + 1), (None if r == 0 else (r - 1, c))
+    if direction == 1:
+        return (r, c + 1), (r + 1, c + 1), (None if c == w - 2 else (r, c + 1))
+    if direction == 2:
+        return (r + 1, c), (r + 1, c + 1), (
+            None if r == h - 2 else (r + 1, c)
+        )
+    return (r, c), (r + 1, c), (None if c == 0 else (r, c - 1))
+
+
+def enumerate_weighted_simple_paths(start, target, mask, reliability):
+    """枚举小对偶图中的简单路径，按边权 1+两端可靠度之和独立计算。"""
+    h, w = len(mask), len(mask[0])
+    found = []
+
+    def weight(a, b):
+        return 1.0 + reliability[a[0]][a[1]] + reliability[b[0]][b[1]]
+
+    def dfs(cell, dirs, edges, cost, seen):
+        if cell == target:
+            found.append((cost, tuple(dirs), tuple(edges)))
+            return
+        for direction in range(4):
+            a, b, nxt = dual_move_edge(cell, direction, h, w)
+            if nxt is None or nxt in seen or not (
+                mask[a[0]][a[1]] and mask[b[0]][b[1]]
+            ):
+                continue
+            edge = tuple(sorted((a, b)))
+            dfs(
+                nxt,
+                dirs + [direction],
+                edges + [edge],
+                cost + weight(a, b),
+                seen | {nxt},
+            )
+
+    dfs(start, [], [], 0.0, {start})
+    return sorted(found, key=lambda item: (item[0], item[1]))
 
 
 def cut_components(cuts, valid):
@@ -343,6 +388,124 @@ class TestVortex(unittest.TestCase):
         self.assertEqual(regions, len(res.regions))
 
 
+class TestReliabilityRouting(unittest.TestCase):
+    def test_low_reliability_corridor_wins_by_enumerated_simple_paths(self):
+        h = w = 4
+        start, target = (0, 0), (2, 2)
+        mask = all_true(h, w)
+        g = analytic_vortices(h, w, {start: +1, target: -1})
+        self.assertEqual(ref_residues(g, mask), [(0, 0, 1), (2, 2, -1)])
+
+        # 把 E,E,S,S 路径压成低可靠度走廊，S,S,E,E 设成高可靠度。
+        reliability = [[0.0] * w for _ in range(h)]
+        for c in range(w):
+            reliability[0][c] = 0.0
+            reliability[1][c] = 0.0
+        for r in range(h):
+            reliability[r][2] = 10.0
+            reliability[r][3] = 10.0
+
+        expected = enumerate_weighted_simple_paths(
+            start, target, mask, reliability
+        )[0]
+        res = unwrap_phase(g, mask, reliability=reliability)
+        got_edges = tuple(sorted((
+            (e.row1, e.col1), (e.row2, e.col2)
+        ) for e in res.cuts))
+
+        self.assertEqual(expected[1], (2, 2, 1, 1))
+        self.assertEqual(got_edges, tuple(sorted(expected[2])))
+        self.assertEqual(len(res.cuts), 4)
+        regions, bad = independent_flood_check(g, mask, res.cuts)
+        self.assertEqual(bad, [])
+        self.assertEqual(regions, len(res.regions))
+
+    def test_equal_reliability_falls_back_to_direction_order(self):
+        h = w = 4
+        g = analytic_vortices(
+            h, w, {(0, 0): +1, (2, 2): -1}
+        )
+        mask = all_true(h, w)
+        res = unwrap_phase(g, mask, reliability=[[5.0] * w for _ in range(h)])
+        # 等代价最短路径方向序列 E,E,S,S。
+        self.assertEqual(
+            set(res.cuts),
+            {
+                phasecut.CutEdge(0, 1, 1, 1),
+                phasecut.CutEdge(0, 2, 1, 2),
+                phasecut.CutEdge(1, 2, 1, 3),
+                phasecut.CutEdge(2, 2, 2, 3),
+            },
+        )
+        regions, bad = independent_flood_check(g, mask, res.cuts)
+        self.assertEqual(bad, [])
+        self.assertEqual(regions, len(res.regions))
+
+    def test_zero_reliability_matches_omitted_reliability(self):
+        h = w = 9
+        mask = all_true(h, w)
+        g = analytic_vortices(h, w, {(2, 4): +1, (2, 6): -1, (4, 4): -1})
+        baseline = unwrap_phase(g, mask)
+        explicit_zero = unwrap_phase(
+            g, mask, reliability=[[0.0] * w for _ in range(h)]
+        )
+        self.assertEqual(explicit_zero.cuts, baseline.cuts)
+        self.assertEqual(explicit_zero.unwrapped, baseline.unwrapped)
+
+    def test_opposite_charges_separated_by_mask_do_not_pair(self):
+        h = w = 7
+        mask = [[False] * w for _ in range(h)]
+        for r in range(2, 5):
+            mask[r][0] = mask[r][1] = True
+            mask[r][5] = mask[r][6] = True
+        g = analytic_vortices(h, w, {(2, 0): +1, (2, 5): -1})
+        self.assertEqual(ref_residues(g, mask), [(2, 0, 1), (2, 5, -1)])
+
+        res = unwrap_phase(
+            g, mask, reliability=[[0.0] * w for _ in range(h)]
+        )
+        self.assertEqual(len(res.residues), 2)
+        self.assertEqual(
+            independent_bfs_dist((2, 0), mask, h, w).get((2, 5)), None
+        )
+        for edge in res.cuts:
+            self.assertTrue(mask[edge.row1][edge.col1])
+            self.assertTrue(mask[edge.row2][edge.col2])
+        regions, bad = independent_flood_check(g, mask, res.cuts)
+        self.assertEqual(bad, [])
+        self.assertEqual(regions, len(res.regions))
+
+    def test_invalid_reliability_rejected(self):
+        g = [[0.0, 0.1], [0.2, 0.3]]
+        mask = all_true(2, 2)
+        for bad in (-0.1, float("nan"), float("inf"), True, "1"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidPhaseInputError):
+                    unwrap_phase(
+                        g, mask, reliability=[[0.0, bad], [0.0, 0.0]]
+                    )
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, mask, reliability=[[0.0]])
+
+    def test_extreme_finite_reliability_at_invalid_pixel_is_accepted(self):
+        g = [[0.1, 0.0], [0.2, 0.3]]
+        mask = [[True, False], [True, True]]
+        reliability = [[0.0, sys.float_info.max], [0.0, 0.0]]
+        res = unwrap_phase(g, mask, reliability=reliability)
+        self.assertIsNone(res.unwrapped[0][1])
+
+    def test_arbitrarily_large_integer_reliability_uses_exact_weights(self):
+        h = w = 2
+        mask = all_true(h, w)
+        g = analytic_vortex(h, w, 0, 0)
+        self.assertEqual(ref_residues(g, mask), [(0, 0, 1)])
+        huge = 10**120
+        reliability = [[0, huge], [huge, huge]]
+        res = unwrap_phase(g, mask, reliability=reliability)
+        self.assertEqual(res.cuts, (phasecut.CutEdge(0, 0, 0, 1),))
+        self.assertEqual(res.unmet_edges, ())
+
+
 class TestMasks(unittest.TestCase):
     def test_balanced_vortices_on_isolated_island(self):
         # 无效海中的 5x5 孤岛（不触图像边界），岛内偶极岛内配对。
@@ -378,6 +541,10 @@ class TestMasks(unittest.TestCase):
         self.assertEqual(ref_residues(g, mask), [(4, 4, 1)])
         with self.assertRaises(NoSolutionError):
             unwrap_phase(g, mask)
+        with self.assertRaises(NoSolutionError):
+            unwrap_phase(
+                g, mask, reliability=[[0.0] * w for _ in range(h)]
+            )
 
     def test_two_mask_components_two_regions(self):
         h = w = 10

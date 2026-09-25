@@ -4,9 +4,9 @@
 
 1. 对每个四点全有效的 2×2 环路，用包裹到 [-pi, pi) 的邻差求和，
    四舍五入到最近整数得到整数残差电荷（典型为 -1/0/+1）。
-2. 残差按 (row, col) 字典序处理：每个未配对残差在对偶格点图上 BFS，
-   找曼哈顿距离最短的异号残差配对，等距时取字典序最小者；
-   配不上的剩余残差各自走最短有效路径到图像外边界。
+2. 残差按 (row, col) 字典序处理：每个未配对残差在对偶格点图上求非负
+   边权最短路，按最小路径代价、再目标坐标选择异号残差；同成本路径按
+   固定方向序决胜；配不上的剩余残差再各自连可达外边界。
 3. 路径跨过的像素邻接边置为切口，洪泛积分时不可跨越。
 4. 每个切口连通区从字典序最小像素起洪凡展开，锚点整数偏移基准为 0。
 5. 对所有非切口有效边做一致性复核，矛盾以 unmet_edges 如实输出，
@@ -18,7 +18,8 @@
 from __future__ import annotations
 
 import math
-from collections import deque
+import heapq
+from fractions import Fraction
 from typing import NamedTuple, Optional
 
 __all__ = [
@@ -51,8 +52,7 @@ RESIDUE_TOLERANCE = 1e-9
 UNWRAP_TOLERANCE = 1e-9
 DEFAULT_SEARCH_BUDGET = 1_000_000
 
-# 固定的四方向字典序：北、东、南、西。BFS 首次访问序由此唯一确定，
-# 从而等距路径也是确定性的。
+# 固定的四方向字典序：北、东、南、西。等成本路径由此唯一确定。
 _DIRECTIONS = ((-1, 0), (0, 1), (1, 0), (0, -1))
 
 
@@ -143,14 +143,14 @@ class InvalidPhaseInputError(PhaseCutError, ValueError):
 
 
 class SearchBudgetExhausted(PhaseCutError):
-    """BFS 访问节点数达到 search_budget，搜索未能完成。
+    """最短路访问节点数达到 search_budget，搜索未能完成。
 
     这是“不知道是否有解”，区别于 NoSolutionError 的“已证明无解”。
     """
 
 
 class NoSolutionError(PhaseCutError):
-    """完整 BFS 证明剩余残差既无异号可配、也无有效路径到达外边界。"""
+    """完整最短路搜索证明剩余残差既无异号可配、也无有效路径到达外边界。"""
 
 
 class UnwrappingContradictionError(PhaseCutError):
@@ -190,7 +190,7 @@ def _canonical_edge(a: tuple[int, int], b: tuple[int, int]) -> CutEdge:
 # --------------------------------------------------------------------------
 # 输入校验
 # --------------------------------------------------------------------------
-def _validate(phase, mask, search_budget: int):
+def _validate(phase, mask, search_budget: int, reliability):
     if not isinstance(search_budget, int) or isinstance(search_budget, bool):
         raise InvalidPhaseInputError(
             "search_budget must be an int; bool is not accepted"
@@ -219,6 +219,20 @@ def _validate(phase, mask, search_budget: int):
     width: Optional[int] = None
     p_grid: list[list[float]] = []
     m_grid: list[list[bool]] = []
+    r_grid: Optional[list[list[Fraction]]] = None
+
+    if reliability is not None:
+        if isinstance(reliability, (str, bytes)) or not isinstance(
+            reliability, (list, tuple)
+        ):
+            raise InvalidPhaseInputError(
+                "reliability must be a sequence of numeric rows or None"
+            )
+        if len(reliability) != len(phase):
+            raise InvalidPhaseInputError(
+                f"reliability has {len(reliability)} rows but phase has {len(phase)}"
+            )
+        r_grid = []
 
     for r, (prow, mrow) in enumerate(zip(phase, mask)):
         if isinstance(prow, (str, bytes)) or not isinstance(prow, (list, tuple)):
@@ -244,6 +258,20 @@ def _validate(phase, mask, search_budget: int):
 
         p_out: list[float] = []
         m_out: list[bool] = []
+        r_out: list[Fraction] = []
+        if reliability is not None:
+            rel_row = reliability[r]
+            if isinstance(rel_row, (str, bytes)) or not isinstance(
+                rel_row, (list, tuple)
+            ):
+                raise InvalidPhaseInputError(
+                    "reliability row must be a sequence", row=r
+                )
+            if len(rel_row) != len(prow):
+                raise InvalidPhaseInputError(
+                    f"reliability row length {len(rel_row)} != phase row length {width}",
+                    row=r,
+                )
         for c, (v, mv) in enumerate(zip(prow, mrow)):
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise InvalidPhaseInputError(
@@ -266,13 +294,41 @@ def _validate(phase, mask, search_budget: int):
                 raise InvalidPhaseInputError(
                     "mask value must be bool (int 0/1 not silently accepted)", row=r, col=c
                 )
+            if reliability is not None:
+                rv = rel_row[c]
+                if isinstance(rv, bool) or not isinstance(rv, (int, float)):
+                    raise InvalidPhaseInputError(
+                        "reliability value must be a non-negative real int/float "
+                        "(bool, complex, str rejected)",
+                        row=r,
+                        col=c,
+                    )
+                if isinstance(rv, float):
+                    if math.isnan(rv) or math.isinf(rv) or rv < 0.0:
+                        raise InvalidPhaseInputError(
+                            "reliability value must be finite and non-negative",
+                            row=r,
+                            col=c,
+                        )
+                    frv = Fraction(rv)
+                else:
+                    if rv < 0:
+                        raise InvalidPhaseInputError(
+                            "reliability value must be finite and non-negative",
+                            row=r,
+                            col=c,
+                        )
+                    frv = Fraction(rv)
+                r_out.append(frv)
             p_out.append(fv)
             m_out.append(mv)
         p_grid.append(p_out)
         m_grid.append(m_out)
+        if reliability is not None:
+            r_grid.append(r_out)
 
     assert width is not None
-    return p_grid, m_grid, height, width
+    return p_grid, m_grid, height, width, r_grid
 
 
 # --------------------------------------------------------------------------
@@ -313,7 +369,7 @@ def _compute_residues(w, mask, height, width):
 
 
 # --------------------------------------------------------------------------
-# 对偶图 BFS
+# 对偶图加权最短路
 # --------------------------------------------------------------------------
 def _dual_moves(cell, mask, height, width):
     """从对偶格 cell=(r,c) 出发的步：(nr,nc) 或 None(出界), 跨过的像素边, 方向序。
@@ -341,31 +397,56 @@ def _dual_moves(cell, mask, height, width):
     return moves
 
 
-def _dual_bfs(start, mask, height, width, budget: int):
-    """从残差格做完整 BFS，返回 (dist, parent_edge, used)。
+def _edge_weight(edge_px, reliability) -> Fraction:
+    if reliability is None:
+        return Fraction(1, 1)
+    (r1, c1), (r2, c2) = edge_px
+    return Fraction(1, 1) + reliability[r1][c1] + reliability[r2][c2]
+
+
+def _dual_shortest_paths(start, mask, reliability, height, width, budget: int):
+    """从残差格求全部非负边权最短路，返回 (dist, parent_edge, used)。
 
     parent_edge[cell] = (上一单元格, 跨过的 CutEdge)；起点为 None。
+    等代价路径按 N,E,S,W 方向序得到唯一字典序最小方向序列；reliability
+    为 None 或全 0 时与原无权 BFS 选择一致。
     超出 budget 抛 SearchBudgetExhausted（结果丢弃，不产生部分切口）。
     """
-    dist = {start: 0}
+    dist = {start: Fraction(0, 1)}
     parent: dict[tuple[int, int], Optional[tuple[tuple[int, int], CutEdge]]] = {
         start: None
     }
-    queue = deque([start])
+    best_dirs = {start: ()}
+    heap: list[tuple[Fraction, tuple[int, ...], tuple[int, int]]] = [
+        (Fraction(0, 1), (), start)
+    ]
     used = 1
-    while queue:
-        cell = queue.popleft()
+    while heap:
+        current_cost, dirs, cell = heapq.heappop(heap)
+        if current_cost != dist[cell] or dirs != best_dirs[cell]:
+            continue
         for nxt, edge_px, _dir in _dual_moves(cell, mask, height, width):
-            if nxt is None or nxt in dist:
+            if nxt is None:
                 continue
-            if used >= budget:
+            weight = _edge_weight(edge_px, reliability)
+            new_cost = current_cost + weight
+            new_dirs = dirs + (_dir,)
+            old_cost = dist.get(nxt)
+            old_dirs = best_dirs.get(nxt)
+            candidate_key = (new_cost, new_dirs)
+            if old_cost is not None and (old_cost, old_dirs) <= candidate_key:
+                continue
+            is_new = old_cost is None
+            if is_new and used >= budget:
                 raise SearchBudgetExhausted(
-                    f"dual-graph BFS node budget {budget} exhausted from residue {start}"
+                    f"dual-graph shortest-path node budget {budget} exhausted from residue {start}"
                 )
-            used += 1
-            dist[nxt] = dist[cell] + 1
+            if is_new:
+                used += 1
+            dist[nxt] = new_cost
+            best_dirs[nxt] = new_dirs
             parent[nxt] = (cell, _canonical_edge(*edge_px))
-            queue.append(nxt)
+            heapq.heappush(heap, (new_cost, new_dirs, nxt))
     return dist, parent, used
 
 
@@ -387,23 +468,33 @@ def _border_path(parent, exit_cell, exit_edge: CutEdge) -> list[CutEdge]:
 # --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
-def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> UnwrapResult:
+def unwrap_phase(
+    phase,
+    mask,
+    *,
+    reliability=None,
+    search_budget: int = DEFAULT_SEARCH_BUDGET,
+) -> UnwrapResult:
     """残差切口相位展开（纯函数：不修改 phase/mask）。
 
     非法输入抛 InvalidPhaseInputError（带 row/col）；搜索预算耗尽抛
     SearchBudgetExhausted；剩余残差证明无法到达外边界抛 NoSolutionError；
     环和不是 2π 整数倍抛 UnwrappingContradictionError。
+
+    纯函数，不修改 phase、mask 或 reliability。
     """
-    w, m, height, width = _validate(phase, mask, search_budget)
+    w, m, height, width, rel = _validate(
+        phase, mask, search_budget, reliability
+    )
 
     residues, charges = _compute_residues(w, m, height, width)
 
     cuts: set[CutEdge] = set()
     unpaired: set[tuple[int, int]] = {(res.row, res.col) for res in residues}
 
-    # ---- 第一遍：字典序贪心，异号最短曼哈顿配对 --------------------------
+    # ---- 第一遍：字典序贪心，异号最小边权路径配对 ------------------------
     # 先处理的残差若当时没有可达的异号对象，会自然留在 unpaired 中；
-    # 之后处理到的异号残差做 BFS 时仍可把它配走（无向图，可达对称）。
+    # 之后处理到的异号残差做最短路时仍可把它配走（无向图，可达对称）。
     for res in residues:
         src = (res.row, res.col)
         if src not in unpaired:
@@ -411,7 +502,9 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         targets = [p for p in unpaired if p != src and charges[p] == -charges[src]]
         if not targets:
             continue
-        dist, parent, _used = _dual_bfs(src, m, height, width, search_budget)
+        dist, parent, _used = _dual_shortest_paths(
+            src, m, rel, height, width, search_budget
+        )
         reachable = [(dist[p], p) for p in targets if p in dist]
         if not reachable:
             continue
@@ -424,18 +517,21 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
 
     # ---- 第二遍：剩余残差（按字典序）各自连到外边界 ----------------------
     for src in sorted(unpaired):
-        dist, parent, _used = _dual_bfs(src, m, height, width, search_budget)
-        best = None  # (总长, 出口格字典序, 方向序, 路径)
+        dist, parent, _used = _dual_shortest_paths(
+            src, m, rel, height, width, search_budget
+        )
+        best = None  # (总代价, 出口格字典序, 方向序, 路径)
         for cell, d in dist.items():
             r, c = cell
             for nxt, edge_px, dir_idx in _dual_moves(cell, m, height, width):
                 if nxt is not None:
                     continue  # 仅 nxt is None 表示这一步直接跨出图像外边界
-                key = (d + 1, cell, dir_idx)
+                edge = _canonical_edge(*edge_px)
+                key = (d + _edge_weight(edge_px, rel), cell, dir_idx)
                 if best is None or key < best[0]:
                     best = (
                         key,
-                        _border_path(parent, cell, _canonical_edge(*edge_px)),
+                        _border_path(parent, cell, edge),
                     )
         if best is None:
             raise NoSolutionError(

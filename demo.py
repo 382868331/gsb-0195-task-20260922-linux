@@ -6,7 +6,8 @@
 1. 无涡旋斜坡（频繁跨 pi 包裹）：无残差、无切口、单区精确还原。
 2. 单涡旋参考（解析 atan2 场）：对比“不加切口的朴素洪泛”与加切口后的
    环路误差——前者在涡核环留下约 2π 的矛盾，后者非切口边全部一致。
-3. 实际触发的边界：NaN 输入被带坐标拒绝；孤岛涡旋证明无解；
+3. 非负像素可靠度把切口引入低可靠度走廊（边权=1+两端可靠度之和）。
+4. 实际触发的边界：NaN 输入被带坐标拒绝；孤岛涡旋证明无解；
    搜索预算耗尽与无解明确区分。
 """
 
@@ -173,8 +174,38 @@ def main():
     print("  结论: ±2π 的矛盾被一条到外边界的切口显式承担，"
           "而不是被平滑结果掩盖。")
 
-    # --- 3a. 实际触发：NaN 输入被带坐标拒绝 -------------------------------
-    section("3a. 异常边界：NaN 输入必须被拒绝（可定位、不静默纠正）")
+    # --- 3. 低可靠度走廊：加权最短路 -------------------------------------
+    section("3. 可靠度加权：4x4 对角电荷，边权=1+两端可靠度之和")
+    h = w = 4
+    g3 = [
+        [
+            wrap_phase(
+                math.atan2(r - 0.5, c - 0.5)
+                - math.atan2(r - 2.5, c - 2.5)
+            )
+            for c in range(w)
+        ]
+        for r in range(h)
+    ]
+    mask3 = [[True] * w for _ in range(h)]
+    rel_equal = [[1.0] * w for _ in range(h)]
+    rel_low_south = [[1.0] * w for _ in range(h)]
+    for c in range(w):
+        rel_low_south[0][c] = 0.0
+        rel_low_south[1][c] = 0.0
+    for r in range(h):
+        rel_low_south[r][2] = 10.0
+        rel_low_south[r][3] = 10.0
+    res_equal = unwrap_phase(g3, mask3, reliability=rel_equal)
+    res_weighted = unwrap_phase(g3, mask3, reliability=rel_low_south)
+    print("  残差:", [(x.row, x.col, x.charge) for x in res_equal.residues])
+    print("  全相等可靠度切口:", [str(e) for e in res_equal.cuts])
+    print("  低可靠度走廊切口:", [str(e) for e in res_weighted.cuts])
+    print(f"  加权后非切口残差数: {len(res_weighted.unmet_edges)}")
+    print("  说明: 等权时固定方向序取 E,E,S,S；高可靠东边受罚后改走 S,S,E,E。")
+
+    # --- 4a. 实际触发：NaN 输入被带坐标拒绝 -------------------------------
+    section("4a. 异常边界：NaN 输入必须被拒绝（可定位、不静默纠正）")
     bad_phase = [[0.1 * c for c in range(5)] for _ in range(5)]
     bad_phase[3][2] = float("nan")
     try:
@@ -183,8 +214,8 @@ def main():
         print(f"  实际捕获 {type(exc).__name__}: {exc}")
         print(f"  定位 row={exc.row}, col={exc.col}")
 
-    # --- 3b. 实际触发：孤岛涡旋 = 证明无解 --------------------------------
-    section("3b. 异常边界：无效海孤岛内的单个涡旋 —— 证明无解")
+    # --- 4b. 实际触发：孤岛涡旋 = 证明无解 --------------------------------
+    section("4b. 异常边界：无效海孤岛内的单个涡旋 —— 证明无解")
     h = w = 11
     island = [[False] * w for _ in range(h)]
     for r in range(4, 7):
@@ -204,8 +235,8 @@ def main():
         print(f"  实际捕获 {type(exc).__name__}")
         print(f"  信息: {exc}")
 
-    # --- 3c. 实际触发：预算耗尽 ≠ 无解 ------------------------------------
-    section("3c. 异常边界：搜索预算耗尽（与“证明无解”严格区分）")
+    # --- 4c. 实际触发：预算耗尽 ≠ 无解 ------------------------------------
+    section("4c. 异常边界：搜索预算耗尽（与“证明无解”严格区分）")
     g2 = [
         [wrap_phase(math.atan2(r - 4.5, c - 4.5)) for c in range(9)]
         for r in range(9)
