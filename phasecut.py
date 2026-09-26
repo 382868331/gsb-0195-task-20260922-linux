@@ -39,6 +39,8 @@ __all__ = [
     "UnwrappingContradictionError",
     "wrap_phase",
     "unwrap_phase",
+    "solve_two_frequency",
+    "enumerate_week_pairs",
 ]
 
 MAX_SIZE = 32
@@ -118,6 +120,50 @@ class UnwrapResult(NamedTuple):
     #: 与输入同形的展开相位；无效像素位置为 None。
     unwrapped: tuple[tuple[Optional[float], ...], ...]
     unmet_edges: tuple[UnmetEdge, ...]
+
+
+class WeekCandidate(NamedTuple):
+    """双频绝对相位的一个可行候选。
+
+    n1/n2 为两种频率各自的整数周数：观测 i 的绝对相位为
+    wrapped_i + 2*pi*n_i，对应公共绝对相位
+    Phi = (wrapped_1 + 2*pi*n1)/freq1 = (wrapped_2 + 2*pi*n2)/freq2
+    （误差带内）。[lo, hi] 为 Phi 在两条观测误差带与给定搜索区间
+    交集下仍可行的闭区间；恰接触（lo == hi）也算可行。
+    """
+
+    n1: int
+    n2: int
+    lo: float
+    hi: float
+
+    @property
+    def center(self) -> float:
+        return 0.5 * (self.lo + self.hi)
+
+
+class TwoFreqResult(NamedTuple):
+    """solve_two_frequency 的返回结果（不可变）。
+
+    candidates[r][c]：该像素全部可行 WeekCandidate（按 lo 排序），
+    mask 无效位置为 None。counts[r][c] 为候选数（无效位置 None）。
+    solved/ambiguous/empty_pixels 分别为候选数 ==1 / >1 / ==0 的
+    有效像素数；歧义候选数如实输出，不挑最接近 0 的候选。
+    filtered 仅在 neighbor_filter=True 时给出：保留与每个有效四邻
+    至少一个候选区间相交的候选；它只是显式筛选视图，counts 与
+    歧义统计始终基于未筛选的 candidates。
+    """
+
+    freq1: int
+    freq2: int
+    phi_min: float
+    phi_max: float
+    candidates: tuple[tuple[Optional[tuple[WeekCandidate, ...]], ...], ...]
+    counts: tuple[tuple[Optional[int], ...], ...]
+    solved_pixels: int
+    ambiguous_pixels: int
+    empty_pixels: int
+    filtered: Optional[tuple[tuple[Optional[tuple[WeekCandidate, ...]], ...]]]
 
 
 # --------------------------------------------------------------------------
@@ -522,4 +568,238 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         regions=tuple(regions_out),
         unwrapped=grid,
         unmet_edges=tuple(unmet),
+    )
+
+
+# --------------------------------------------------------------------------
+# 双频绝对周数求解
+# --------------------------------------------------------------------------
+def _validate_two_freq(
+    phase1, phase2, mask, freq1, freq2, error1, error2, phi_min, phi_max,
+):
+    for name, f in (("freq1", freq1), ("freq2", freq2)):
+        if not isinstance(f, int) or isinstance(f, bool):
+            raise InvalidPhaseInputError(
+                f"{name} must be a positive int; bool is not accepted"
+            )
+        if f < 1:
+            raise InvalidPhaseInputError(f"{name} must be >= 1")
+    if math.gcd(freq1, freq2) != 1:
+        raise InvalidPhaseInputError(
+            f"freq1={freq1} and freq2={freq2} must be coprime"
+        )
+    for name, e in (("error1", error1), ("error2", error2)):
+        if isinstance(e, bool) or not isinstance(e, (int, float)):
+            raise InvalidPhaseInputError(
+                f"{name} must be a real number; bool is not accepted"
+            )
+        if math.isnan(float(e)) or math.isinf(float(e)) or float(e) < 0.0:
+            raise InvalidPhaseInputError(
+                f"{name} must be finite and >= 0"
+            )
+    for name, b in (("phi_min", phi_min), ("phi_max", phi_max)):
+        if isinstance(b, bool) or not isinstance(b, (int, float)):
+            raise InvalidPhaseInputError(
+                f"{name} must be a real number; bool is not accepted"
+            )
+        if math.isnan(float(b)) or math.isinf(float(b)):
+            raise InvalidPhaseInputError(f"{name} must be finite")
+    if not float(phi_min) < float(phi_max):
+        raise InvalidPhaseInputError(
+            f"phi_min ({phi_min!r}) must be < phi_max ({phi_max!r})"
+        )
+    if isinstance(phase2, (str, bytes)) or not isinstance(phase2, (list, tuple)):
+        raise InvalidPhaseInputError("phase2 must be a sequence of numeric rows")
+    if len(phase2) != len(phase1):
+        raise InvalidPhaseInputError(
+            f"phase2 has {len(phase2)} rows but phase1 has {len(phase1)}"
+        )
+    return float(error1), float(error2), float(phi_min), float(phi_max)
+
+
+def _week_candidates_pixel(
+    w1: float,
+    w2: float,
+    k1: int,
+    k2: int,
+    e1: float,
+    e2: float,
+    lo: float,
+    hi: float,
+) -> tuple[WeekCandidate, ...]:
+    """单像素：先用周期关系缩小 (n1, n2)，再逐一代回两种频率检验。
+
+    观测 i 给出 Phi 的可行带 (wrapped_i + 2*pi*n_i)/k_i 加减 e_i/k_i。
+    两带一致要求 k2*n1 - k1*n2 = r，其中 r 为整数且
+    |r - t| <= (k2*e1 + k1*e2)/(2*pi)，t = (k1*w2 - k2*w1)/(2*pi)。
+    对每个可行 r 用 CRT（k1, k2 互素）把 n1 钉在一个 mod k1 剩余类上，
+    只枚举该剩余类落在区间内的 n1，再逐一代回两种频率求闭区间交集。
+    """
+    t = (k1 * w2 - k2 * w1) / TWO_PI
+    slack = (k2 * e1 + k1 * e2) / TWO_PI
+    # 区间搜索余量：仅容纳浮点散布，不改变数学判定。
+    eps = 1e-9
+    r_lo = math.ceil(t - slack - eps)
+    r_hi = math.floor(t + slack + eps)
+    if r_lo > r_hi:
+        return ()
+    inv_k2 = pow(k2 % k1, -1, k1)  # k2 在 mod k1 下的逆元（互素保证存在）
+    n1_min = math.ceil((k1 * lo - e1 - w1) / TWO_PI - eps)
+    n1_max = math.floor((k1 * hi + e1 - w1) / TWO_PI + eps)
+    out: list[WeekCandidate] = []
+    for r in range(r_lo, r_hi + 1):
+        # k2*n1 ≡ r (mod k1)  →  n1 ≡ r*inv_k2 (mod k1)
+        base = (r * inv_k2) % k1
+        if base < n1_min:
+            base += k1 * ((n1_min - base + k1 - 1) // k1)
+        # 归一化到 [n1_min, n1_min + k1)：负周数也必须覆盖。
+        base -= k1 * ((base - n1_min) // k1)
+        for n1 in range(base, n1_max + 1, k1):
+            num = k2 * n1 - r
+            if num % k1 != 0:
+                continue  # 防御：CRT 已保证整除
+            n2 = num // k1
+            c_lo = max(lo, (w1 + TWO_PI * n1 - e1) / k1,
+                       (w2 + TWO_PI * n2 - e2) / k2)
+            c_hi = min(hi, (w1 + TWO_PI * n1 + e1) / k1,
+                       (w2 + TWO_PI * n2 + e2) / k2)
+            if c_lo <= c_hi + eps:
+                out.append(WeekCandidate(n1, n2, c_lo, max(c_lo, c_hi)))
+    out.sort(key=lambda c: (c.lo, c.hi, c.n1, c.n2))
+    return tuple(out)
+
+
+def enumerate_week_pairs(
+    w1: float,
+    w2: float,
+    freq1: int,
+    freq2: int,
+    error1: float,
+    error2: float,
+    phi_min: float,
+    phi_max: float,
+) -> tuple[WeekCandidate, ...]:
+    """短范围穷举参考：直接枚举 (n1, n2) 整数对逐一求交集。
+
+    与 solve_two_frequency 的 CRT 路径互相独立，供测试对照；
+    只适合区间/频率都很小的情形。
+    """
+    e1, e2 = float(error1), float(error2)
+    eps = 1e-9
+    n1_min = math.ceil((freq1 * phi_min - e1 - w1) / TWO_PI - eps)
+    n1_max = math.floor((freq1 * phi_max + e1 - w1) / TWO_PI + eps)
+    n2_min = math.ceil((freq2 * phi_min - e2 - w2) / TWO_PI - eps)
+    n2_max = math.floor((freq2 * phi_max + e2 - w2) / TWO_PI + eps)
+    out: list[WeekCandidate] = []
+    for n1 in range(n1_min, n1_max + 1):
+        for n2 in range(n2_min, n2_max + 1):
+            c_lo = max(phi_min, (w1 + TWO_PI * n1 - e1) / freq1,
+                       (w2 + TWO_PI * n2 - e2) / freq2)
+            c_hi = min(phi_max, (w1 + TWO_PI * n1 + e1) / freq1,
+                       (w2 + TWO_PI * n2 + e2) / freq2)
+            if c_lo <= c_hi + eps:
+                out.append(WeekCandidate(n1, n2, c_lo, max(c_lo, c_hi)))
+    out.sort(key=lambda c: (c.lo, c.hi, c.n1, c.n2))
+    return tuple(out)
+
+
+def solve_two_frequency(
+    phase1,
+    phase2,
+    mask,
+    freq1: int,
+    freq2: int,
+    error1: float,
+    error2: float,
+    phi_min: float,
+    phi_max: float,
+    *,
+    neighbor_filter: bool = False,
+) -> TwoFreqResult:
+    """两幅同位置包裹相位 + 互素频率，求有限区间内全部一致解。
+
+    phase_i 为频率 freq_i 下观测到的包裹相位（[-pi, pi)），
+    error_i 为该观测独立的误差上限（弧度，>=0）。对每个有效像素
+    返回 [phi_min, phi_max] 内所有可行 WeekCandidate；不存在的像素
+    候选为空元组（如实报告，不抛异常、不挑最接近 0 的候选）。
+    mask 为 False 的位置不参与任何计算与邻域筛选。
+    neighbor_filter=True 时额外给出 filtered 视图（见 TwoFreqResult），
+    它只做显式筛选，绝不把本来多解的点宣布唯一。
+    """
+    e1, e2, lo, hi = _validate_two_freq(
+        phase1, phase2, mask, freq1, freq2, error1, error2, phi_min, phi_max,
+    )
+    # 复用单幅接口的结构/数值校验（search_budget 用默认值，不展开）。
+    w1, m, height, width = _validate(phase1, mask, DEFAULT_SEARCH_BUDGET)
+    w2, _m2, h2, w2d = _validate(phase2, mask, DEFAULT_SEARCH_BUDGET)
+    assert (h2, w2d) == (height, width)
+
+    cand_rows: list[list[Optional[tuple[WeekCandidate, ...]]]] = []
+    count_rows: list[list[Optional[int]]] = []
+    solved = ambiguous = empty = 0
+    for r in range(height):
+        cand_row: list[Optional[tuple[WeekCandidate, ...]]] = []
+        count_row: list[Optional[int]] = []
+        for c in range(width):
+            if not m[r][c]:
+                cand_row.append(None)
+                count_row.append(None)
+                continue
+            cands = _week_candidates_pixel(
+                w1[r][c], w2[r][c], freq1, freq2, e1, e2, lo, hi,
+            )
+            cand_row.append(cands)
+            count_row.append(len(cands))
+            if len(cands) == 1:
+                solved += 1
+            elif len(cands) > 1:
+                ambiguous += 1
+            else:
+                empty += 1
+        cand_rows.append(cand_row)
+        count_rows.append(count_row)
+
+    filtered = None
+    if neighbor_filter:
+        filtered_rows: list[list[Optional[tuple[WeekCandidate, ...]]]] = []
+        for r in range(height):
+            f_row: list[Optional[tuple[WeekCandidate, ...]]] = []
+            for c in range(width):
+                cands = cand_rows[r][c]
+                if cands is None:
+                    f_row.append(None)
+                    continue
+                kept = list(cands)
+                for dr, dc in _DIRECTIONS:
+                    nr, nc = r + dr, c + dc
+                    if not (0 <= nr < height and 0 <= nc < width):
+                        continue
+                    neigh = cand_rows[nr][nc]
+                    if neigh is None:
+                        continue  # 掩码位置不参与筛选
+                    if not neigh:
+                        continue  # 邻像素自身无可行解时不据此筛除
+                    kept = [
+                        cand
+                        for cand in kept
+                        if any(
+                            cand.lo <= other.hi and other.lo <= cand.hi
+                            for other in neigh
+                        )
+                    ]
+                f_row.append(tuple(kept))
+            filtered_rows.append(f_row)
+        filtered = tuple(tuple(row) for row in filtered_rows)
+
+    return TwoFreqResult(
+        freq1=freq1,
+        freq2=freq2,
+        phi_min=lo,
+        phi_max=hi,
+        candidates=tuple(tuple(row) for row in cand_rows),
+        counts=tuple(tuple(row) for row in count_rows),
+        solved_pixels=solved,
+        ambiguous_pixels=ambiguous,
+        empty_pixels=empty,
+        filtered=filtered,
     )

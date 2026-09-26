@@ -7,6 +7,13 @@
 结果把数据矛盾（涡旋）显式放到切口和 `unmet_edges` 里，**不用看似平滑的
 展开结果掩盖 ±2π 的环矛盾**。
 
+本次迭代新增**双频绝对周数求解**（`solve_two_frequency`）：输入两幅同位置
+包裹相位、两个互素正整数频率和各自的独立误差上限，在给定的有限绝对相位
+区间内找出**全部**一致解（可行区间或唯一候选），而不是总挑最接近 0 的
+一个。先用周期关系（CRT）缩小整数周数组合，再逐一代回两种频率检验；
+掩码位置不参与任何空间传播，邻域平滑只是显式可选筛选，绝不会把本来
+多解的点直接宣布唯一。
+
 - Python：**3.14.7**（3.10+ 的语法也可运行，但按 3.14.7 验收）
 - 依赖：**仅 Python 标准库**（`math`、`collections`、`typing`）。装好 Python 后
   无需安装任何其他东西；核心、测试、演示全部离线、确定性运行。
@@ -14,12 +21,21 @@
 
 ## 运行
 
+可选 venv 准备（非必需，任何 Python 3.14.7 解释器都能直接跑）：
+
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（30 个用例，含 200+6 例确定性 fuzz）
-python demo.py                             # 固定输入演示，约 0.03 秒
+python3.14 -m venv .venv          # 或 python -m venv .venv
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python demo_iteration.py
 ```
 
-两条终端命令即全部入口；没有网站、CLI 产品、服务或后台任务。
+```bash
+python -m unittest discover -s tests -v   # 必要测试（48 个用例，含确定性 fuzz 与 CRT/穷举对照）
+python demo.py                             # 单幅残差切口演示，约 0.03 秒
+python demo_iteration.py                   # 双频绝对周数演示 + 边界情况，约 0.03 秒
+```
+
+三条终端命令即全部入口；没有网站、CLI 产品、服务或后台任务。
 
 ## 接口
 
@@ -50,6 +66,53 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 | `unmet_edges` | `UnmetEdge(..., residual)`：所有**非切口**有效边中，展开差与包裹邻差不一致超过口径的边，按字典序。常规矩形数据为空；当整数卷绕绕 mask 洞、或落在两侧均无完整 2×2 环的“不可切口边”上时非空——该矛盾不归属于任何可计算残差的环、无法用切口表示，按契约如实报告而非掩盖。 |
 
 ### 错误语义（固定、可定位、不静默纠正）
+
+## 双频绝对周数求解接口（本次迭代新增）
+
+```python
+from phasecut import solve_two_frequency, enumerate_week_pairs
+
+result = solve_two_frequency(
+    phase1, phase2, mask,
+    freq1, freq2,           # 互素正整数频率
+    error1, error2,         # 每条观测独立的误差上限（弧度，>= 0）
+    phi_min, phi_max,       # 有限绝对相位搜索区间
+    neighbor_filter=False,  # 邻域平滑只是显式可选筛选
+)
+```
+
+模型：观测 i 的包裹相位 `w_i = wrap(freq_i * Phi)`，`Phi` 为待求绝对相位。
+观测 i 给出 `Phi` 的可行带 `(w_i + 2*pi*n_i)/freq_i ± error_i/freq_i`；
+两带一致要求整数 `r = freq2*n1 - freq1*n2` 落在
+`|r - t| <= (freq2*error1 + freq1*error2)/(2*pi)`（`t = (freq1*w2 - freq2*w1)/(2*pi)`）。
+求解**先用这个周期关系以 CRT（互素保证 `freq2` 在 mod `freq1` 下可逆）把
+`n1` 钉在若干 mod `freq1` 剩余类上**，只枚举落在区间内的 `n1`，再逐一
+代回两种频率求闭区间交集——交集非空（含恰接触 `lo == hi`）即为一个候选。
+互素频率的合成频率为 1，**合成周期 = 2*pi**：搜索区间每跨一个 2*pi，
+同一观测会多出一组候选，歧义候选数如实输出。
+
+- `phase1`/`phase2`/`mask` 的结构、类型、数值校验与单幅接口完全相同
+  （复用同一套校验：[-π, π)、拒绝 NaN/Inf、mask 必须 bool）。
+- `freq1`/`freq2`：正整数 `int`（拒绝 `bool`），且必须**互素**，
+  否则抛 `InvalidPhaseInputError`。
+- `error1`/`error2`：有限实数 `>= 0`（拒绝 `bool`/NaN/Inf）。
+- `phi_min < phi_max`，均须有限。
+- 掩码位置：候选为 `None`，**不参与任何计算与邻域筛选**；本接口不做
+  跨像素空间传播，每个像素独立求解。
+
+返回不可变的 `TwoFreqResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `candidates[r][c]` | 该像素全部 `WeekCandidate(n1, n2, lo, hi)`（按 `lo` 排序）；无效位置 `None`。`[lo, hi]` 为两条误差带与搜索区间的可行闭区间。 |
+| `counts[r][c]` | 候选数（0/1/>1），无效位置 `None`。造成歧义的候选数就在这里如实输出。 |
+| `solved_pixels` / `ambiguous_pixels` / `empty_pixels` | 候选数 ==1 / >1 / ==0 的有效像素数。 |
+| `filtered` | 仅 `neighbor_filter=True` 时非 `None`：保留与每个有效四邻至少一个候选区间相交的候选。它只是显式筛选视图；`counts` 与歧义统计始终基于未筛选的 `candidates`，多解点不会被宣布唯一。 |
+
+**没有可行解不是异常**：不相容观测得到空候选元组与 `empty_pixels` 计数，
+照常返回。`enumerate_week_pairs(w1, w2, f1, f2, e1, e2, lo, hi)` 是**短范围
+穷举参考**（直接枚举 `(n1, n2)` 整数对），与 CRT 路径互相独立，供测试
+对照与手算验证，只适合小区间/小频率。
 
 | 异常 | 触发条件 |
 |---|---|
@@ -120,6 +183,16 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 - 贪心配对不保证切口总长度全局最小。
 - 不做区之间的全局 2π 对齐；`baseline` 恒为 0。
 
+双频接口的已知限制：
+
+- 频率必须互素（合成频率为 1）；不互素时合成周期小于 2π，本迭代不
+  覆盖该情形，直接拒绝。
+- 候选区间是两条观测误差带的**闭区间**交集；误差上限被当作硬界，
+  恰接触（`lo == hi`）计为可行。
+- 每个像素独立求解，不做跨像素空间传播；`neighbor_filter` 只是事后
+  显式筛选视图，不改变 `counts`/歧义统计。
+- 候选判定含 1e-9 的浮点散布余量（与单幅口径同级），不改变数学判定。
+
 ## 文件
 
 - `phasecut.py` — 唯一核心模块，可直接 `import phasecut`。
@@ -129,3 +202,9 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   补充断言。
 - `demo.py` — 固定输入：无涡旋斜坡（频繁跨 π）、单涡旋参考的切口前后
   矛盾度量，以及 NaN 拒绝、孤岛无解、预算耗尽三个实际触发的边界。
+- `tests/test_twofreq.py` — 双频接口测试：可手算的互素频率 3/4 与 2/3
+  用例、区间跨一个合成周期的歧义计数、误差带恰接触、不相容观测、
+  掩码位置、邻域筛选语义、非法输入拒绝，以及 CRT 路径与短范围穷举
+  参考的 300 例确定性对照；另含旧接口冒烟回归。
+- `demo_iteration.py` — 双频演示：唯一解、跨合成周期的歧义候选数、
+  误差带恰接触与不相容观测两个边界情况，全部真实计算（<1 秒）。
