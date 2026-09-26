@@ -27,18 +27,23 @@ __all__ = [
     "RESIDUE_TOLERANCE",
     "UNWRAP_TOLERANCE",
     "DEFAULT_SEARCH_BUDGET",
+    "MERGE_TOLERANCE",
+    "FEASIBILITY_TOLERANCE",
     "Residue",
     "CutEdge",
     "UnmetEdge",
     "Region",
     "UnwrapResult",
+    "DualFrequencyResult",
     "PhaseCutError",
     "InvalidPhaseInputError",
     "SearchBudgetExhausted",
     "NoSolutionError",
     "UnwrappingContradictionError",
+    "IncompatibleObservationsError",
     "wrap_phase",
     "unwrap_phase",
+    "resolve_absolute_cycles",
 ]
 
 MAX_SIZE = 32
@@ -50,6 +55,14 @@ PI = math.pi
 RESIDUE_TOLERANCE = 1e-9
 UNWRAP_TOLERANCE = 1e-9
 DEFAULT_SEARCH_BUDGET = 1_000_000
+# 可行区间合并口径：两个区间端点间距不超过它时视为相接并合并。
+# 只用于把“误差带恰接触”的相邻区间表示为一段，不影响单点可行性判定
+# （单点判定用严格的不等式 |f*phi - w - 2*pi*n| <= err，边界含端点）。
+MERGE_TOLERANCE = 1e-12
+# 整数周数枚举与零宽区间判定的浮点口径（弧度，绝对相位单位）。
+# 误差带端点由不同路径的浮点运算得到，理论重合点可能有 ~1e-16 的散布；
+# 1e-9 留有巨大余量，真正的间隔（误差带分离）必然远大于它。
+FEASIBILITY_TOLERANCE = 1e-9
 
 # 固定的四方向字典序：北、东、南、西。BFS 首次访问序由此唯一确定，
 # 从而等距路径也是确定性的。
@@ -163,6 +176,24 @@ class UnwrappingContradictionError(PhaseCutError):
         super().__init__(
             f"wrapped loop sum at (row={row}, col={col}) is {loop_sum!r}, "
             f"not within {RESIDUE_TOLERANCE:g} rad of an integer multiple of 2*pi"
+        )
+
+
+class IncompatibleObservationsError(PhaseCutError):
+    """可选的严格模式：某有效像素在给定误差带与区间内没有任何可行解。
+
+    默认模式（strict=False）不会抛出本异常，而是在结果中把该像素记为
+    空区间元组并计入 empty_pixels；strict=True 时遇到第一个不相容像素
+    即抛出，携带可定位的 row/col。
+    """
+
+    def __init__(self, row: int, col: int):
+        self.row = row
+        self.col = col
+        super().__init__(
+            f"no feasible absolute phase at (row={row}, col={col}): "
+            f"the two wrapped observations are incompatible within their "
+            f"error bands on the given interval"
         )
 
 
@@ -522,4 +553,223 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         regions=tuple(regions_out),
         unwrapped=grid,
         unmet_edges=tuple(unmet),
+    )
+
+
+# ==========================================================================
+# 双频包裹相位联合确定绝对周数
+# ==========================================================================
+class DualFrequencyResult(NamedTuple):
+    """两幅同位置包裹相位在两个互素频率下的联合解。
+
+    intervals / candidate_counts 与输入同形；mask 无效位置为 None。
+    intervals[r][c] 为 ((lo, hi), ...)，按 lo 升序、互不重迭的可行绝对
+    相位区间（含端点）；空元组表示该像素在误差带与区间内无可行解。
+    candidate_counts[r][c] = len(intervals[r][c])，>1 即歧义像素。
+    ambiguous_pixels / empty_pixels 为全图计数；smoothing_applied 记录
+    是否应用了显式可选的邻域筛选。
+    """
+
+    freq1: int
+    freq2: int
+    phi_min: float
+    phi_max: float
+    intervals: tuple[tuple[Optional[tuple[tuple[float, float], ...]], ...], ...]
+    candidate_counts: tuple[tuple[Optional[int], ...], ...]
+    ambiguous_pixels: int
+    empty_pixels: int
+    smoothing_applied: bool
+
+
+def _validate_dual(phase1, phase2, freq1, freq2, err1, err2,
+                   phi_min, phi_max, mask):
+    for name, f in (("freq1", freq1), ("freq2", freq2)):
+        if not isinstance(f, int) or isinstance(f, bool):
+            raise InvalidPhaseInputError(f"{name} must be an int; bool is not accepted")
+        if f < 1:
+            raise InvalidPhaseInputError(f"{name} must be a positive integer")
+    if math.gcd(freq1, freq2) != 1:
+        raise InvalidPhaseInputError(
+            f"freq1={freq1} and freq2={freq2} must be coprime"
+        )
+    for name, e in (("err1", err1), ("err2", err2)):
+        if isinstance(e, bool) or not isinstance(e, (int, float)):
+            raise InvalidPhaseInputError(f"{name} must be a real int/float")
+        if math.isnan(float(e)) or math.isinf(float(e)) or float(e) < 0.0:
+            raise InvalidPhaseInputError(f"{name} must be a finite number >= 0")
+    for name, p in (("phi_min", phi_min), ("phi_max", phi_max)):
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise InvalidPhaseInputError(f"{name} must be a real int/float")
+        if math.isnan(float(p)) or math.isinf(float(p)):
+            raise InvalidPhaseInputError(f"{name} must be finite")
+    if not float(phi_min) < float(phi_max):
+        raise InvalidPhaseInputError("phi_min must be strictly less than phi_max")
+
+    # 复用 unwrap_phase 的结构/数值校验（相位域、有限性、mask 布尔性）。
+    full_mask = [[True] * len(phase1[0]) for _ in range(len(phase1))] \
+        if isinstance(phase1, (list, tuple)) and phase1 \
+        and isinstance(phase1[0], (list, tuple)) else [[True]]
+    w1, _m1, height, width = _validate(phase1, full_mask, 1)
+    w2, _m2, h2, w2d = _validate(phase2, full_mask, 1)
+    if (h2, w2d) != (height, width):
+        raise InvalidPhaseInputError(
+            f"phase2 shape ({h2}x{w2d}) != phase1 shape ({height}x{width})"
+        )
+    if mask is None:
+        m_grid = [[True] * width for _ in range(height)]
+    else:
+        _w, m_grid, mh, mw = _validate(full_mask_phase(height, width), mask, 1)
+        if (mh, mw) != (height, width):
+            raise InvalidPhaseInputError(
+                f"mask shape ({mh}x{mw}) != phase shape ({height}x{width})"
+            )
+    return w1, w2, m_grid, height, width
+
+
+def full_mask_phase(height: int, width: int):
+    """内部辅助：生成 height×width 的全零相位（仅用于复用 mask 校验）。"""
+    return [[0.0] * width for _ in range(height)]
+
+
+def _pixel_intervals(w1v, w2v, freq1, freq2, err1, err2, phi_min, phi_max):
+    """单像素：返回 [phi_min, phi_max] 内所有可行绝对相位区间（升序）。
+
+    第一步（周期关系缩小组合）：频率 1 的可行带中心为
+    (w1 + 2*pi*n1)/f1，落在区间内的 n1 只有有限个，直接枚举；
+    对每个 n1，频率 2 的周数 n2 由
+    n2 ≈ (f2*(w1 + 2*pi*n1) - f1*w2) / (2*pi*f1) 取整唯一锁定
+    （互素保证合成周期为 2*pi，n1 -> n1+f1、n2 -> n2+f2 给出下一个
+    合成周期处的同构组合）。
+    第二步（逐一代回两种频率检验）：把每个 (n1, n2) 组合的两条误差带
+    [(w_i + 2*pi*n_i - err_i)/f_i, (w_i + 2*pi*n_i + err_i)/f_i]
+    与 [phi_min, phi_max] 求交，非空（含端点恰接触）即保留，最后合并
+    相接/重迭段。
+    """
+    lo1 = (freq1 * phi_min - err1 - w1v) / TWO_PI
+    hi1 = (freq1 * phi_max + err1 - w1v) / TWO_PI
+    n1_lo = math.ceil(lo1 - FEASIBILITY_TOLERANCE)
+    n1_hi = math.floor(hi1 + FEASIBILITY_TOLERANCE)
+    raw: list[tuple[float, float]] = []
+    for n1 in range(n1_lo, n1_hi + 1):
+        band1_lo = (w1v + TWO_PI * n1 - err1) / freq1
+        band1_hi = (w1v + TWO_PI * n1 + err1) / freq1
+        # 频率 2 侧：只可能与覆盖 band1 扩展范围的 n2 带相交。
+        n2_lo = math.ceil((freq2 * band1_lo - err2 - w2v) / TWO_PI
+                          - FEASIBILITY_TOLERANCE)
+        n2_hi = math.floor((freq2 * band1_hi + err2 - w2v) / TWO_PI
+                           + FEASIBILITY_TOLERANCE)
+        for n2 in range(n2_lo, n2_hi + 1):
+            lo = max(band1_lo, (w2v + TWO_PI * n2 - err2) / freq2, phi_min)
+            hi = min(band1_hi, (w2v + TWO_PI * n2 + err2) / freq2, phi_max)
+            # 端点恰接触（lo == hi）也是可行点；1e-9 口径吸收零宽带的
+            # 浮点散布，真正的间隔必然远大于它。
+            if lo <= hi + FEASIBILITY_TOLERANCE:
+                hi = max(lo, hi)
+                raw.append((lo, hi))
+    if not raw:
+        return ()
+    raw.sort()
+    merged: list[list[float]] = [[raw[0][0], raw[0][1]]]
+    for lo, hi in raw[1:]:
+        if lo <= merged[-1][1] + MERGE_TOLERANCE:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return tuple((lo, hi) for lo, hi in merged)
+
+
+def _intervals_overlap(a, b) -> bool:
+    return any(lo <= bh + MERGE_TOLERANCE and blo <= h + MERGE_TOLERANCE
+               for lo, h in a for blo, bh in b)
+
+
+def resolve_absolute_cycles(phase1, phase2, freq1, freq2, *,
+                            err1, err2, phi_min, phi_max, mask=None,
+                            neighborhood_filter: bool = False,
+                            strict: bool = False) -> DualFrequencyResult:
+    """两幅同位置包裹相位 + 两个互素频率 -> 每像素全部可行绝对相位区间。
+
+    phase1/phase2：同形包裹相位（[-pi, pi)，校验口径同 unwrap_phase）。
+    freq1/freq2：互素正整数频率（拒绝 bool、非互素）。
+    err1/err2：两幅观测各自独立的包裹相位误差上限（弧度，>= 0）。
+    [phi_min, phi_max]：有限的绝对相位搜索区间（含端点）。
+    mask：可选 bool 网格；无效像素不参与任何空间传播，结果中为 None。
+    neighborhood_filter：显式可选的邻域多数筛选（默认关闭）。开启后，
+        对每个多解像素，若其全部四邻接有效像素的可行区间与自身某一
+        区间公共相交，则只保留该区间。这只是后处理筛选，可能丢弃真实
+        多解，结果中 smoothing_applied=True 如实标记。
+    strict：默认 False，不相容像素在结果中记为空区间并计入
+        empty_pixels；True 时遇到第一个不相容像素即抛
+        IncompatibleObservationsError（带 row/col）。
+
+    绝不“挑最接近 0 的一个”：所有可行区间一律如实返回，歧义以
+    candidate_counts / ambiguous_pixels 显式暴露。
+    """
+    if not isinstance(neighborhood_filter, bool):
+        raise InvalidPhaseInputError("neighborhood_filter must be a bool")
+    if not isinstance(strict, bool):
+        raise InvalidPhaseInputError("strict must be a bool")
+    w1, w2, m, height, width = _validate_dual(
+        phase1, phase2, freq1, freq2, err1, err2, phi_min, phi_max, mask
+    )
+    err1 = float(err1)
+    err2 = float(err2)
+    phi_min = float(phi_min)
+    phi_max = float(phi_max)
+
+    grid: list[list[Optional[tuple[tuple[float, float], ...]]]] = [
+        [None] * width for _ in range(height)
+    ]
+    empty = 0
+    for r in range(height):
+        for c in range(width):
+            if not m[r][c]:
+                continue
+            iv = _pixel_intervals(
+                w1[r][c], w2[r][c], freq1, freq2, err1, err2, phi_min, phi_max
+            )
+            if not iv and strict:
+                raise IncompatibleObservationsError(r, c)
+            if not iv:
+                empty += 1
+            grid[r][c] = iv
+
+    smoothing = False
+    if neighborhood_filter:
+        smoothing = True
+        for r in range(height):
+            for c in range(width):
+                cur = grid[r][c]
+                if cur is None or len(cur) <= 1:
+                    continue
+                common = list(cur)
+                for dr, dc in _DIRECTIONS:
+                    nr, nc = r + dr, c + dc
+                    if not (0 <= nr < height and 0 <= nc < width):
+                        continue
+                    nb = grid[nr][nc]
+                    if nb is None or not nb:
+                        continue
+                    common = [iv for iv in common if _intervals_overlap([iv], nb)]
+                if len(common) == 1:
+                    grid[r][c] = (common[0],)
+
+    counts = tuple(
+        tuple(None if grid[r][c] is None else len(grid[r][c]) for c in range(width))
+        for r in range(height)
+    )
+    ambiguous = sum(
+        1 for r in range(height) for c in range(width)
+        if counts[r][c] is not None and counts[r][c] > 1
+    )
+    return DualFrequencyResult(
+        freq1=freq1,
+        freq2=freq2,
+        phi_min=phi_min,
+        phi_max=phi_max,
+        intervals=tuple(tuple(row) for row in grid),
+        candidate_counts=counts,
+        ambiguous_pixels=ambiguous,
+        empty_pixels=empty,
+        smoothing_applied=smoothing,
     )

@@ -12,14 +12,25 @@
   无需安装任何其他东西；核心、测试、演示全部离线、确定性运行。
 - 规模上限：高、宽均 **≤ 32**（`phasecut.MAX_SIZE`）。
 
+## 准备（venv）
+
+不需要安装任何第三方包，venv 只是为了隔离解释器；仓库根目录的
+`.venv` 符号链接指向已备好的 3.14.7 环境，也可自建：
+
+```bash
+python3.14 -m venv .venv        # 任意 Python 3.14.7 均可
+. .venv/bin/activate            # 也可直接用 .venv/bin/python 而不激活
+```
+
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（30 个用例，含 200+6 例确定性 fuzz）
-python demo.py                             # 固定输入演示，约 0.03 秒
+python -m unittest discover -s tests -v   # 必要测试（42 个用例，含 200+6 例确定性 fuzz）
+python demo.py                             # 单幅残差切口演示，约 0.03 秒
+python demo_iteration.py                   # 双频定周演示 + 边界情况，约 0.01 秒
 ```
 
-两条终端命令即全部入口；没有网站、CLI 产品、服务或后台任务。
+终端命令即全部入口；没有网站、CLI 产品、服务或后台任务。
 
 ## 接口
 
@@ -60,6 +71,64 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 
 `SearchBudgetExhausted`（不知道有没有解）与 `NoSolutionError`（证明无解）
 是两个不同异常，绝不混用。`demo.py` 3c 用同一输入分别演示两者。
+
+## 双频联合确定绝对周数（新接口）
+
+```python
+from phasecut import resolve_absolute_cycles
+
+res = resolve_absolute_cycles(
+    phase1, phase2, freq1, freq2,
+    err1=0.02, err2=0.03,          # 两幅观测各自独立的误差上限（弧度）
+    phi_min=-10.0, phi_max=10.0,   # 有限绝对相位区间（含端点）
+    mask=mask,                     # 可选；无效像素不参与、不传播
+    neighborhood_filter=False,     # 显式可选的邻域筛选，默认关闭
+    strict=False,                  # True 时不相容像素抛异常而非记空解
+)
+```
+
+- `phase1` / `phase2`：同位置、同形的两幅包裹相位（[-π, π)，校验口径同
+  `unwrap_phase`）。观测模型：`wrap(freq_i * Φ) = phase_i`，
+  即 `Φ = (w_i + 2π·n_i) / freq_i`。
+- `freq1` / `freq2`：**互素**正整数频率（拒绝 bool、非互素、非正数）。
+  互素保证合成周期为 2π：`n1→n1+f1、n2→n2+f2` 给出下一个合成周期处的
+  同构组合。
+- 算法：**先用周期关系缩小整数周数组合**——枚举落在区间内的 `n1`
+  （有限个），每个 `n1` 由 `n2 ≈ (f2(w1+2πn1) − f1·w2)/(2πf1)` 锁定
+  少数候选 `n2`；**再逐一代回两种频率检验**——对每组 `(n1, n2)` 把两条
+  误差带与 `[phi_min, phi_max]` 求交，非空（含端点恰接触）即保留，
+  最后合并相接区间。
+- **返回所有可行区间，绝不只挑最接近 0 的一个**。区间跨多个合成周期
+  时歧义如实保留，并由 `candidate_counts` / `ambiguous_pixels` 显式暴露。
+- 掩码像素不参与任何空间传播（本接口逐像素独立求解，掩码位置结果为
+  `None`）。`neighborhood_filter=True` 是**显式可选**的邻域重叠筛选：
+  仅当某多解像素的某一区间与全部有效邻居的可行区间都相交时才收窄到
+  该区间；它可能丢弃真实多解，结果以 `smoothing_applied=True` 如实标记，
+  默认关闭，绝不会把本来多解的点静默宣布唯一。
+
+返回不可变的 `DualFrequencyResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `intervals` | 与输入同形；每有效像素为 `((lo, hi), ...)` 升序不重叠可行区间（含端点），空元组 = 无可行解，掩码位置为 `None`。 |
+| `candidate_counts` | 同形；每像素可行区间数（造成歧义的候选数），掩码位置为 `None`。 |
+| `ambiguous_pixels` | 候选数 > 1 的像素总数。 |
+| `empty_pixels` | 无可行解（不相容观测）的像素总数。 |
+| `smoothing_applied` | 是否应用了显式邻域筛选。 |
+
+### 双频接口的错误语义
+
+| 异常 | 触发条件 |
+|---|---|
+| `InvalidPhaseInputError` | 频率非互素/非正/非 int、误差为负或 NaN/Inf、`phi_min >= phi_max`、两幅相位不同形、相位/掩码非法（带 `row`/`col`）。 |
+| `IncompatibleObservationsError` | 仅 `strict=True`：某有效像素在误差带与区间内无任何可行解，带 `row`/`col`。默认模式下该像素记为空区间并计入 `empty_pixels`，不抛异常。 |
+
+### 双频接口的浮点口径
+
+- 可行性判定含端点：误差带恰接触（`lo == hi`）是可行点。
+- `FEASIBILITY_TOLERANCE = 1e-9`（弧度，绝对相位单位）：吸收零宽误差带
+  端点在不同浮点运算路径下的 ~1e-16 散布；真实的带间隔必然远大于它。
+- `MERGE_TOLERANCE = 1e-12`：仅用于把端点相接的相邻区间表示为一段。
 
 ## 算法与设计取舍
 
@@ -119,6 +188,9 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   直接体现，确定性用例与 200 例随机 fuzz 均有覆盖。
 - 贪心配对不保证切口总长度全局最小。
 - 不做区之间的全局 2π 对齐；`baseline` 恒为 0。
+- 双频接口逐像素独立求解，不做跨像素的空间传播/全局对齐；绝对区间
+  `[phi_min, phi_max]` 由调用方给定，区间跨几个合成周期就保留几个候选，
+  本模块不替调用方消歧（邻域筛选须显式开启且会标记）。
 
 ## 文件
 
@@ -129,3 +201,10 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   补充断言。
 - `demo.py` — 固定输入：无涡旋斜坡（频繁跨 π）、单涡旋参考的切口前后
   矛盾度量，以及 NaN 拒绝、孤岛无解、预算耗尽三个实际触发的边界。
+- `tests/test_dualfreq.py` — 双频定周测试。期望值由文件内**独立**的
+  短范围穷举参考产生（直接枚举 (n1, n2) 周数组合逐对求交），不调用
+  被测核心；含可手算互素频率、区间跨多个合成周期、误差带恰接触、
+  不相容观测、掩码与显式邻域筛选、参数校验。
+- `demo_iteration.py` — 固定输入：互素频率 2 与 3 的 6×4 斜坡场在跨约
+  3 个合成周期的区间上输出全部可行区间与歧义候选数，并实际演示
+  误差带恰接触与不相容观测两个边界。
