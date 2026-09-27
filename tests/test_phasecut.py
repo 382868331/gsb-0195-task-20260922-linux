@@ -17,9 +17,12 @@ from collections import deque
 
 import phasecut
 from phasecut import (
+    AlignmentConflictError,
     InvalidPhaseInputError,
     NoSolutionError,
+    PhaseReference,
     SearchBudgetExhausted,
+    align_regions,
     wrap_phase,
     unwrap_phase,
     TWO_PI,
@@ -803,6 +806,120 @@ class TestHoleWinding(unittest.TestCase):
                        for e in res.unmet_edges),
                 sorted((a, b, c, d) for (a, b, c, d, _v) in bad),
             )
+
+
+class TestAlignRegions(unittest.TestCase):
+    """区域参考点对齐：整体 2π 偏移、冲突必报、无参考区域保持原样。"""
+
+    def two_islands(self):
+        h = w = 10
+        mask = [[False] * w for _ in range(h)]
+        for r in range(0, 3):
+            for c in range(0, 3):
+                mask[r][c] = True
+        for r in range(6, 9):
+            for c in range(6, 9):
+                mask[r][c] = True
+        g = [[wrap_phase(0.2 * r + 0.1 * c) for c in range(w)]
+             for r in range(h)]
+        return g, mask
+
+    def test_align_one_region_leaves_other_untouched(self):
+        g, mask = self.two_islands()
+        res = unwrap_phase(g, mask)
+        self.assertEqual(len(res.regions), 2)
+        # 独立期望：第二区 (6,6) 的局部展开值 + 3·2π 作为目标。
+        target = res.unwrapped[6][6] + 3 * TWO_PI
+        aligned = align_regions(res, [(6, 6, target)])
+        self.assertEqual(aligned.regions[1].baseline, 3)
+        self.assertTrue(all(k == 3 for k in aligned.regions[1].offsets))
+        self.assertAlmostEqual(aligned.unwrapped[6][6], target, places=12)
+        # 无参考的第一区保持未对齐，局部结果原样保留。
+        self.assertEqual(aligned.regions[0], res.regions[0])
+        for r, c in res.regions[0].pixels:
+            self.assertEqual(aligned.unwrapped[r][c], res.unwrapped[r][c])
+        # 切口、残差、未满足边报告不因对齐而消失或改变。
+        self.assertEqual(aligned.cuts, res.cuts)
+        self.assertEqual(aligned.residues, res.residues)
+        self.assertEqual(aligned.unmet_edges, res.unmet_edges)
+        # 入参不被修改（纯函数）。
+        self.assertEqual(res.regions[1].baseline, 0)
+
+    def test_agreeing_references_same_region(self):
+        g, mask = self.two_islands()
+        res = unwrap_phase(g, mask)
+        t1 = res.unwrapped[6][6] - 2 * TWO_PI
+        t2 = res.unwrapped[8][8] - 2 * TWO_PI
+        aligned = align_regions(
+            res, [PhaseReference(6, 6, t1), (8, 8, t2)]
+        )
+        self.assertEqual(aligned.regions[1].baseline, -2)
+        self.assertAlmostEqual(aligned.unwrapped[8][8], t2, places=12)
+
+    def test_conflicting_references_reported_not_smoothed(self):
+        g, mask = self.two_islands()
+        res = unwrap_phase(g, mask)
+        t1 = res.unwrapped[6][6] + 1 * TWO_PI
+        t2 = res.unwrapped[8][8] + 2 * TWO_PI  # 要求不同的整数偏移
+        with self.assertRaises(AlignmentConflictError) as ctx:
+            align_regions(res, [(6, 6, t1), (8, 8, t2)])
+        exc = ctx.exception
+        self.assertEqual(exc.anchor, (6, 6))
+        self.assertEqual(len(exc.details), 2)
+        self.assertEqual(sorted(d[3] for d in exc.details), [1, 2])
+        self.assertIsInstance(exc, phasecut.PhaseCutError)
+
+    def test_target_inconsistent_with_local_phase_conflicts(self):
+        g, mask = self.two_islands()
+        res = unwrap_phase(g, mask)
+        # 目标与任何整数个 2π 平移都对不上（偏差 1.0 rad，超口径）。
+        bad_target = res.unwrapped[6][6] + 1.0
+        with self.assertRaises(AlignmentConflictError):
+            align_regions(res, [(6, 6, bad_target)])
+
+    def test_reference_on_invalid_pixel_rejected(self):
+        g, mask = self.two_islands()
+        res = unwrap_phase(g, mask)
+        with self.assertRaises(InvalidPhaseInputError) as ctx:
+            align_regions(res, [(4, 4, 0.0)])  # mask 无效像素
+        self.assertEqual((ctx.exception.row, ctx.exception.col), (4, 4))
+        with self.assertRaises(InvalidPhaseInputError):
+            align_regions(res, [(10, 0, 0.0)])  # 越界
+
+    def test_bad_reference_types_rejected(self):
+        g, mask = self.two_islands()
+        res = unwrap_phase(g, mask)
+        for bad in (
+            [(6, 6)],                    # 元素数不足
+            [(6, 6, float("nan"))],      # NaN 目标
+            [(6, 6, float("inf"))],      # Infinity 目标
+            [(True, 6, 0.0)],            # bool 行坐标
+            [(6, 6, "0.0")],             # 字符串目标
+        ):
+            with self.assertRaises(InvalidPhaseInputError):
+                align_regions(res, bad)
+
+    def test_no_references_returns_equal_result(self):
+        g, mask = self.two_islands()
+        res = unwrap_phase(g, mask)
+        aligned = align_regions(res, [])
+        self.assertEqual(aligned, res)
+
+    def test_alignment_preserves_cuts_and_unmet_edges(self):
+        # 带真实 unmet_edges 的场景：1 像素洞上的绕洞卷绕。
+        h = w = 9
+        mask = [[True] * w for _ in range(h)]
+        mask[4][4] = False
+        g = [[wrap_phase(math.atan2(r - 4.5, c - 4.5)) for c in range(w)]
+             for r in range(h)]
+        res = unwrap_phase(g, mask)
+        self.assertGreaterEqual(len(res.unmet_edges), 1)
+        target = res.unwrapped[0][0] + 2 * TWO_PI
+        aligned = align_regions(res, [(0, 0, target)])
+        self.assertEqual(aligned.unmet_edges, res.unmet_edges)
+        self.assertEqual(aligned.cuts, res.cuts)
+        self.assertEqual(aligned.residues, res.residues)
+        self.assertEqual(aligned.regions[0].baseline, 2)
 
 
 class TestContradictionContract(unittest.TestCase):

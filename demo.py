@@ -14,10 +14,12 @@ import math
 import time
 
 from phasecut import (
+    AlignmentConflictError,
     InvalidPhaseInputError,
     NoSolutionError,
     SearchBudgetExhausted,
     TWO_PI,
+    align_regions,
     unwrap_phase,
     wrap_phase,
 )
@@ -218,6 +220,42 @@ def main():
     ok = unwrap_phase(g2, mask2, search_budget=1_000_000)
     print(f"  同一输入预算充足时正常完成：残差 {len(ok.residues)} 个，"
           f"未满足边 {len(ok.unmet_edges)} 条 —— 耗尽是“没算完”，不是无解。")
+
+    # --- 4. 区域参考点对齐 -------------------------------------------------
+    section("4. 区域参考点对齐（两个 mask 孤岛，整体 2π 偏移）")
+    h = w = 10
+    mask4 = [[False] * w for _ in range(h)]
+    for r in range(0, 3):
+        for c in range(0, 3):
+            mask4[r][c] = True
+    for r in range(6, 9):
+        for c in range(6, 9):
+            mask4[r][c] = True
+    g4 = [[wrap_phase(0.2 * r + 0.1 * c) for c in range(w)]
+          for r in range(h)]
+    res4 = unwrap_phase(g4, mask4)
+    print(f"  连通区数: {len(res4.regions)}，"
+          f"锚点 {[rg.anchor for rg in res4.regions]}，"
+          f"对齐前基准 {[rg.baseline for rg in res4.regions]}")
+    # 已知参考：第二区像素 (6,6) 的真实相位 = 局部展开值 + 3·2π。
+    target = res4.unwrapped[6][6] + 3 * TWO_PI
+    aligned = align_regions(res4, [(6, 6, target)])
+    print(f"  参考点 (6,6) 目标 {target:+.4f} → 第二区整体偏移 "
+          f"k={aligned.regions[1].baseline}，"
+          f"对齐后展开值 {aligned.unwrapped[6][6]:+.4f}")
+    print(f"  无参考的第一区保持未对齐: 基准 k={aligned.regions[0].baseline}，"
+          f"(0,0) 展开值不变 "
+          f"({res4.unwrapped[0][0]:+.4f} -> {aligned.unwrapped[0][0]:+.4f})")
+    print(f"  切口/未满足边报告保留: cuts {len(res4.cuts)} -> "
+          f"{len(aligned.cuts)}，unmet_edges {len(res4.unmet_edges)} -> "
+          f"{len(aligned.unmet_edges)}")
+    # 实际触发：同区两个参考点要求不同的整数偏移 → 冲突必报，不平滑。
+    try:
+        align_regions(res4, [(6, 6, target),
+                             (8, 8, res4.unwrapped[8][8] + 2 * TWO_PI)])
+    except AlignmentConflictError as exc:
+        print(f"  同区矛盾参考实际捕获 {type(exc).__name__}:")
+        print(f"    {exc}")
 
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 68)

@@ -31,14 +31,17 @@ __all__ = [
     "CutEdge",
     "UnmetEdge",
     "Region",
+    "PhaseReference",
     "UnwrapResult",
     "PhaseCutError",
     "InvalidPhaseInputError",
     "SearchBudgetExhausted",
     "NoSolutionError",
     "UnwrappingContradictionError",
+    "AlignmentConflictError",
     "wrap_phase",
     "unwrap_phase",
+    "align_regions",
 ]
 
 MAX_SIZE = 32
@@ -120,6 +123,19 @@ class UnwrapResult(NamedTuple):
     unmet_edges: tuple[UnmetEdge, ...]
 
 
+class PhaseReference(NamedTuple):
+    """一个区域对齐参考点：已知像素位置与目标相位。
+
+    (row, col) 必须是有效像素；target 为该位置展开后应取的目标相位
+    （弧度，任意实数，不限于 [-pi, pi)）。所属连通区据此确定整体
+    整数偏移 k，使展开值平移 2π·k 后该点等于 target（在口径内）。
+    """
+
+    row: int
+    col: int
+    target: float
+
+
 # --------------------------------------------------------------------------
 # 错误类型
 # --------------------------------------------------------------------------
@@ -163,6 +179,27 @@ class UnwrappingContradictionError(PhaseCutError):
         super().__init__(
             f"wrapped loop sum at (row={row}, col={col}) is {loop_sum!r}, "
             f"not within {RESIDUE_TOLERANCE:g} rad of an integer multiple of 2*pi"
+        )
+
+
+class AlignmentConflictError(PhaseCutError):
+    """同一连通区的参考点要求不同的整数偏移，或目标相位与局部结果矛盾。
+
+    anchor: 冲突连通区的锚点；details: 该冲突涉及的全部参考点及其各自
+    要求的整数偏移，元素为 (row, col, target, required_shift)。
+    冲突如实抛出，绝不用平滑/折中偏移掩盖。
+    """
+
+    def __init__(self, anchor, details):
+        self.anchor = anchor
+        self.details = tuple(details)
+        rendered = ", ".join(
+            f"(row={r}, col={c}, target={t!r}, required_shift={k})"
+            for r, c, t, k in self.details
+        )
+        super().__init__(
+            f"conflicting alignment references in region anchored at {anchor}: "
+            + rendered
         )
 
 
@@ -522,4 +559,157 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         regions=tuple(regions_out),
         unwrapped=grid,
         unmet_edges=tuple(unmet),
+    )
+
+
+# --------------------------------------------------------------------------
+# 区域参考点对齐
+# --------------------------------------------------------------------------
+def _validate_reference(ref, index: int) -> PhaseReference:
+    if isinstance(ref, (str, bytes)) or not isinstance(ref, (list, tuple, PhaseReference)):
+        raise InvalidPhaseInputError(
+            f"reference #{index} must be a (row, col, target) sequence"
+        )
+    if len(ref) != 3:
+        raise InvalidPhaseInputError(
+            f"reference #{index} must have exactly 3 elements (row, col, target)"
+        )
+    row, col, target = ref
+    if not isinstance(row, int) or isinstance(row, bool):
+        raise InvalidPhaseInputError(
+            f"reference #{index} row must be an int (bool rejected)"
+        )
+    if not isinstance(col, int) or isinstance(col, bool):
+        raise InvalidPhaseInputError(
+            f"reference #{index} col must be an int (bool rejected)", row=row
+        )
+    if isinstance(target, bool) or not isinstance(target, (int, float)):
+        raise InvalidPhaseInputError(
+            f"reference #{index} target must be a real int/float "
+            "(bool, complex, str rejected)",
+            row=row,
+            col=col,
+        )
+    ftarget = float(target)
+    if math.isnan(ftarget) or math.isinf(ftarget):
+        raise InvalidPhaseInputError(
+            f"reference #{index} target must be finite (NaN/Infinity rejected)",
+            row=row,
+            col=col,
+        )
+    return PhaseReference(row, col, ftarget)
+
+
+def align_regions(
+    result: UnwrapResult,
+    references,
+    *,
+    tolerance: float = UNWRAP_TOLERANCE,
+) -> UnwrapResult:
+    """按参考点把各连通区整体平移整数个 2π，返回新的 UnwrapResult。
+
+    references: (row, col, target) 序列的序列（或 PhaseReference）。
+    每个参考点落在某个连通区内，要求该区整体偏移 k 使该点展开值
+    平移 2π·k 后在 tolerance 口径内等于 target。
+
+    - 同一区域的多个参考点必须要求**同一个** k，且每个 target 都必须
+      与“局部结果 + 2π·k”在口径内一致；否则抛 AlignmentConflictError
+      （带 anchor 与每个参考点各自要求的偏移），不做任何平滑或折中。
+    - 没有参考点的区域保持未对齐：baseline/offsets/unwrapped 原样保留。
+    - residues、cuts、unmet_edges 原样保留——对齐不消灭切口与未满足边
+      的报告。
+    - 参考位置越界或落在无效像素上抛 InvalidPhaseInputError（带坐标）。
+    - 纯函数：不修改入参 result；任何失败都抛异常，不返回部分对齐结果。
+    """
+    if not isinstance(result, UnwrapResult):
+        raise InvalidPhaseInputError("result must be an UnwrapResult")
+    if isinstance(references, (str, bytes)) or not isinstance(references, (list, tuple)):
+        raise InvalidPhaseInputError(
+            "references must be a sequence of (row, col, target)"
+        )
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise InvalidPhaseInputError("tolerance must be a real number")
+    tol = float(tolerance)
+    if math.isnan(tol) or math.isinf(tol) or tol < 0.0:
+        raise InvalidPhaseInputError("tolerance must be a finite, non-negative number")
+
+    refs = tuple(_validate_reference(ref, i) for i, ref in enumerate(references))
+
+    height = len(result.unwrapped)
+    width = len(result.unwrapped[0]) if height else 0
+
+    # 像素 -> 区域下标
+    pixel_region: dict[tuple[int, int], int] = {}
+    for idx, region in enumerate(result.regions):
+        for p in region.pixels:
+            pixel_region[p] = idx
+
+    # 逐参考点求所需整数偏移，按区域归组。
+    region_refs: dict[int, list[tuple[int, int, float, int]]] = {}
+    for ref in refs:
+        if not (0 <= ref.row < height and 0 <= ref.col < width):
+            raise InvalidPhaseInputError(
+                "reference position out of grid bounds", row=ref.row, col=ref.col
+            )
+        pos = (ref.row, ref.col)
+        if pos not in pixel_region:
+            raise InvalidPhaseInputError(
+                "reference position is not a valid (masked-in) pixel",
+                row=ref.row,
+                col=ref.col,
+            )
+        current = result.unwrapped[ref.row][ref.col]
+        k = _nearest_int((ref.target - current) / TWO_PI)
+        region_refs.setdefault(pixel_region[pos], []).append(
+            (ref.row, ref.col, ref.target, k)
+        )
+
+    # 冲突检测：同区 k 不一致，或 target 与 局部结果+2π·k 超口径。
+    region_shift: dict[int, int] = {}
+    for idx in sorted(region_refs):
+        entries = region_refs[idx]
+        shifts = {k for _r, _c, _t, k in entries}
+        anchor = result.regions[idx].anchor
+        if len(shifts) != 1:
+            raise AlignmentConflictError(anchor, entries)
+        k = shifts.pop()
+        bad = [
+            (r, c, t, kk)
+            for r, c, t, kk in entries
+            if abs(result.unwrapped[r][c] + kk * TWO_PI - t) > tol
+        ]
+        if bad:
+            raise AlignmentConflictError(anchor, entries)
+        region_shift[idx] = k
+
+    # 应用偏移：有参考的区域整体平移，其余区域原样保留。
+    new_regions: list[Region] = []
+    new_phi: dict[tuple[int, int], float] = {}
+    for idx, region in enumerate(result.regions):
+        k = region_shift.get(idx, 0)
+        for p, off in zip(region.pixels, region.offsets):
+            new_phi[p] = result.unwrapped[p[0]][p[1]] + k * TWO_PI
+        new_regions.append(
+            Region(
+                anchor=region.anchor,
+                baseline=region.baseline + k,
+                pixels=region.pixels,
+                offsets=tuple(off + k for off in region.offsets),
+            )
+        )
+
+    grid = tuple(
+        tuple(
+            new_phi[(r, c)] if (r, c) in new_phi else None
+            for c in range(width)
+        )
+        for r in range(height)
+    )
+
+    return UnwrapResult(
+        residues=result.residues,
+        cuts=result.cuts,
+        regions=tuple(new_regions),
+        unwrapped=grid,
+        unmet_edges=result.unmet_edges,
     )
