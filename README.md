@@ -15,7 +15,7 @@
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（30 个用例，含 200+6 例确定性 fuzz）
+python -m unittest discover -s tests -v   # 必要测试（39 个用例，含 200+6 例确定性 fuzz）
 python demo.py                             # 固定输入演示，约 0.03 秒
 ```
 
@@ -27,6 +27,9 @@ python demo.py                             # 固定输入演示，约 0.03 秒
 from phasecut import unwrap_phase, wrap_phase
 
 result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
+# 可选：给每个切口连通区提供已知参考点做整圈对齐
+result = unwrap_phase(phase, mask, references=[(row, col, target), ...])
+# 或对已有结果单独对齐：result = align_regions(result, references)
 ```
 
 - `phase`：行序列的行序列，每个元素为 `int`/`float`（拒绝 `bool`、`complex`、
@@ -36,6 +39,11 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   `0/1` 等整数**不**被静默当作布尔值。
 - `search_budget`：正整数 `int`（拒绝 `bool`、浮点、≤0）。单次对偶图 BFS
   允许访问的最大节点数。
+- `references`：可选的参考点序列，元素为 `ReferencePoint(row, col, target)`
+  或 `(row, col, target)` 三元组（可混用）。`(row,col)` 必须是**有效像素**
+  （越界或落在 mask 外即 `InvalidPhaseInputError`），同一像素不得重复；
+  `target` 为有限实相位（拒绝 `bool`/`NaN`/`Infinity`，不要求在 [-π,π)）。
+  参考点按位置字典序处理，结果与传入顺序无关。给 `None`/省略即不对齐。
 - 纯函数：不修改 `phase` / `mask`；成功才返回，失败即抛异常，不存在
   “部分切口已生成”的部分结果。
 
@@ -45,9 +53,26 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 |---|---|
 | `residues` | `Residue(row, col, charge)` 元组，按 `(row,col)` 字典序；`(row,col)` 为 2×2 环左上角，`charge` 为包裹邻差环和 /(2π) 的最近整数（典型 -1/0/+1）。 |
 | `cuts` | `CutEdge(row1,col1,row2,col2)` 元组，字典序；四邻接有效像素边，端点已按字典序排列。洪泛时不可跨越。 |
-| `regions` | `Region(anchor, baseline, pixels, offsets)` 元组，按 `anchor` 排序。每个切口连通区从字典序最小像素 `anchor` 洪泛；`baseline` 恒为 `0`（锚点整数偏移基准），`pixels` 字典序排列，`offsets[i]` 为对应整数 k，展开值 = 包裹值 + 2π·k。 |
+| `regions` | `Region(anchor, baseline, pixels, offsets)` 元组，按 `anchor` 排序。每个切口连通区从字典序最小像素 `anchor` 洪泛；`baseline` 为锚点整数偏移 k（无参考点时恒为 `0`），`pixels` 字典序排列，`offsets[i]` 为对应整数 k，展开值 = 包裹值 + 2π·k。参考点对齐后 `baseline`/`offsets` 整体加上该区的整圈平移量。 |
 | `unwrapped` | 与输入同形的嵌套元组；无效像素位置为 `None`。 |
 | `unmet_edges` | `UnmetEdge(..., residual)`：所有**非切口**有效边中，展开差与包裹邻差不一致超过口径的边，按字典序。常规矩形数据为空；当整数卷绕绕 mask 洞、或落在两侧均无完整 2×2 环的“不可切口边”上时非空——该矛盾不归属于任何可计算残差的环、无法用切口表示，按契约如实报告而非掩盖。 |
+| `alignment` | `RegionAlignment(anchor, shift, aligned, reference_points, residual)` 元组，与 `regions` 一一对应。`shift` 为该区的整体整圈平移；未给参考点的区 `aligned=False`、`shift=0`，**保留原来的局部结果**；`residual` 为区内参考点对齐后的最大偏差（弧度）。 |
+
+### 参考点对齐语义
+
+相位展开后，不同切口连通区的结果可能相差任意整数个 2π。参考点用于消除
+这种**整圈**不确定性：
+
+- 每个参考点独立推出本区整体平移 `shift = round((target - φ_local)/(2π))`；
+- 同一连通区给多个参考点时，推得的整圈数必须完全相同，且扣掉整圈后的
+  分数残差必须在 `UNWRAP_TOLERANCE`（1e-9 rad）内；
+- 整圈数不同，或分数部分对不上，都抛 `ReferenceConflictError`
+  （带区域 `anchor` 与冲突点坐标），**明确指出冲突，绝不靠平滑掩盖**；
+- 没有任何参考点的区保持未对齐：`offsets`、`unwrapped` 原样保留；
+- 对齐只对各区整体加减整数个 2π，`cuts`、`residues`、`unmet_edges`
+  原样保留——**原有切口与未满足边不会因对齐消失或改变**；
+- `align_regions(result, references)` 对已有 `UnwrapResult` 单独做对齐，
+  与 `unwrap_phase(..., references=...)` 结果完全相同；对齐不修改入参。
 
 ### 错误语义（固定、可定位、不静默纠正）
 
@@ -57,6 +82,7 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 | `UnwrappingContradictionError` | 防御性异常：某个全有效 2×2 环的包裹邻差环和不在 2π 整数倍口径内。对**任何真正落在 [-π,π) 的输入**，四点包裹差之和由望远镜相消恒等式必为 2π 的整数倍（浮点散布 ~1e-15），故合法输入实际不会触发；保留它以固定契约并防御未来非标准来源数据。 |
 | `SearchBudgetExhausted` | BFS 访问数达到 `search_budget`，**搜索没算完**。 |
 | `NoSolutionError` | BFS **完整**跑完后，剩余残差既无可达异号电荷、也无有效路径到图像外边界（如被无效海围困的孤岛涡旋）。这是已证明的无解。 |
+| `ReferenceConflictError` | 同一连通区的参考点推出不同整圈偏移，或分数残差超口径。带 `anchor`（区域锚点）与 `points`（冲突参考点）。 |
 
 `SearchBudgetExhausted`（不知道有没有解）与 `NoSolutionError`（证明无解）
 是两个不同异常，绝不混用。`demo.py` 3c 用同一输入分别演示两者。
@@ -89,9 +115,10 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
 
 **取舍说明**：配对是题面指定的字典序贪心 + 最短曼哈顿路径，**不是全局
 最优（最小总切口长度）的电荷平衡算法**；贪心可能不是总长度最小的布设法，
-但结果确定、可复现、可独立核验，且保证非切口边一致。各区锚点基准固定
-为 0，因此**区与区之间可能相差任意整数个 2π**，本模块不做跨区/全局相位
-对齐（题面未定义外部基准）。
+但结果确定、可复现、可独立核验，且保证非切口边一致。各区锚点基准默认
+为 0，因此**区与区之间可能相差任意整数个 2π**；本模块不做无外部依据的
+跨区/全局相位对齐，只在使用者显式给出已知参考点时按整圈对齐各区
+（参考点矛盾即报错，见“参考点对齐语义”）。
 
 ## 浮点误差口径
 
@@ -118,7 +145,10 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   `unmet_edges`（整数个 2π）报告而非静默平滑——这是“不掩盖矛盾”的
   直接体现，确定性用例与 200 例随机 fuzz 均有覆盖。
 - 贪心配对不保证切口总长度全局最小。
-- 不做区之间的全局 2π 对齐；`baseline` 恒为 0。
+- 不做无参考依据的全局 2π 对齐；不给参考点时 `baseline` 恒为 0。
+  参考点只能消除整圈不确定性，不能纠正区域内部的展开矛盾（后者仍以
+  切口/`unmet_edges` 为准）；分数部分对不上的参考点报
+  `ReferenceConflictError`，不做最小二乘式折中。
 
 ## 文件
 
@@ -128,4 +158,5 @@ result = unwrap_phase(phase, mask, *, search_budget=1_000_000)
   多涡旋数据生成），不调用被测核心来得到期望值；`wrap` 往返一致性仅作
   补充断言。
 - `demo.py` — 固定输入：无涡旋斜坡（频繁跨 π）、单涡旋参考的切口前后
-  矛盾度量，以及 NaN 拒绝、孤岛无解、预算耗尽三个实际触发的边界。
+  矛盾度量，NaN 拒绝、孤岛无解、预算耗尽三个实际触发的边界，以及
+  参考点整圈对齐的正常结果与同区参考点冲突的实际拒绝。

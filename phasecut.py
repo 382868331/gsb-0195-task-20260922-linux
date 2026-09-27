@@ -11,6 +11,10 @@
 4. 每个切口连通区从字典序最小像素起洪凡展开，锚点整数偏移基准为 0。
 5. 对所有非切口有效边做一致性复核，矛盾以 unmet_edges 如实输出，
    不用平滑结果掩盖。
+6. 可选的参考点对齐：同一切口连通区可给一个或多个已知参考点
+   (row, col, target)，该区整体平移最近的整数个 2π 使参考点达到
+   目标相位；同区参考点要求的整圈数矛盾时抛 ReferenceConflictError，
+   不用平滑掩盖；没有参考点的区保持未对齐（局部结果原样保留）。
 
 接口与错误语义见模块 README。
 """
@@ -37,8 +41,12 @@ __all__ = [
     "SearchBudgetExhausted",
     "NoSolutionError",
     "UnwrappingContradictionError",
+    "ReferencePoint",
+    "RegionAlignment",
+    "ReferenceConflictError",
     "wrap_phase",
     "unwrap_phase",
+    "align_regions",
 ]
 
 MAX_SIZE = 32
@@ -99,8 +107,9 @@ class UnmetEdge(NamedTuple):
 class Region(NamedTuple):
     """切口图上的一个像素连通区。
 
-    anchor: 区内字典序最小像素；baseline: 锚点整数偏移 k（恒为 0，
-    各区之间相差任意 2π 整数倍，本模块不做全局对齐）。
+    anchor: 区内字典序最小像素；baseline: 对齐后锚点的整数偏移 k。
+    不给参考点时恒为 0——各区之间相差任意 2π 整数倍，保持未对齐；
+    给参考点对齐后 baseline 为该区的整体整圈平移量。
     pixels 按字典序排列，offsets[i] 为 pixels[i] 的整数偏移 k，
     展开值 phi = wrapped + 2π * k。
     """
@@ -111,6 +120,34 @@ class Region(NamedTuple):
     offsets: tuple[int, ...]
 
 
+class ReferencePoint(NamedTuple):
+    """一个已知参考点：有效像素 (row, col) 处展开后应对齐到 target。
+
+    target 为有限实相位（不要求落在 [-pi, pi)）。同一连通区可给多个
+    参考点；它们推得的整体整圈偏移必须一致，否则冲突报错。
+    """
+
+    row: int
+    col: int
+    target: float
+
+
+class RegionAlignment(NamedTuple):
+    """一个连通区的对齐结果（按 anchor 排序，与 regions 一一对应）。
+
+    shift: 该区整体平移的整数圈数；未给参考点时为 0 且 aligned=False。
+    reference_points: 本区用到的参考点像素，按 (row,col) 字典序。
+    residual: 参考点对齐后的最大残差 |phi_aligned-target|（弧度）；
+    无参考点时为 0.0。
+    """
+
+    anchor: tuple[int, int]
+    shift: int
+    aligned: bool
+    reference_points: tuple[tuple[int, int], ...]
+    residual: float
+
+
 class UnwrapResult(NamedTuple):
     residues: tuple[Residue, ...]
     cuts: tuple[CutEdge, ...]
@@ -118,6 +155,8 @@ class UnwrapResult(NamedTuple):
     #: 与输入同形的展开相位；无效像素位置为 None。
     unwrapped: tuple[tuple[Optional[float], ...], ...]
     unmet_edges: tuple[UnmetEdge, ...]
+    #: 每个连通区的参考点对齐情况，顺序与 regions 相同。
+    alignment: tuple[RegionAlignment, ...]
 
 
 # --------------------------------------------------------------------------
@@ -164,6 +203,22 @@ class UnwrappingContradictionError(PhaseCutError):
             f"wrapped loop sum at (row={row}, col={col}) is {loop_sum!r}, "
             f"not within {RESIDUE_TOLERANCE:g} rad of an integer multiple of 2*pi"
         )
+
+
+class ReferenceConflictError(PhaseCutError):
+    """同一连通区的参考点互相矛盾，无法确定唯一的整体整圈偏移。
+
+    两类矛盾分别可定位：
+    - 两个参考点推得的整数圈数不同（相差至少 1 个整圈）；
+    - 整数圈数相同，但分数部分对不上（超出 UNWRAP_TOLERANCE），
+      即任何整圈平移都无法同时满足这些参考点。
+    属性 anchor 给出冲突区域锚点；points 为冲突参考点坐标。
+    """
+
+    def __init__(self, message: str, anchor, points):
+        self.anchor = anchor
+        self.points = tuple(points)
+        super().__init__(message)
 
 
 # --------------------------------------------------------------------------
@@ -387,14 +442,246 @@ def _border_path(parent, exit_cell, exit_edge: CutEdge) -> list[CutEdge]:
 # --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
-def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> UnwrapResult:
+def _validate_references(references, height, width, m_grid):
+    """把 references 归一化为 ReferencePoint 列表并完成全部输入校验。
+
+    references 接受 None 或 ReferencePoint/(row,col,target) 三元组的序列。
+    坐标必须落在有效像素上；target 必须有限。任何结构/类型/数值非法均
+    抛 InvalidPhaseInputError（结构错误 row/col 可能为 None）。
+    """
+    if references is None:
+        return []
+    if isinstance(references, (str, bytes)) or not isinstance(
+        references, (list, tuple)
+    ):
+        raise InvalidPhaseInputError(
+            "references must be a sequence of ReferencePoint/3-tuples"
+        )
+    out: list[ReferencePoint] = []
+    seen: set[tuple[int, int]] = set()
+    for idx, item in enumerate(references):
+        if isinstance(item, ReferencePoint):
+            row, col, target = item.row, item.col, item.target
+        elif (
+            not isinstance(item, (str, bytes))
+            and isinstance(item, (list, tuple))
+            and len(item) == 3
+        ):
+            row, col, target = item
+        else:
+            raise InvalidPhaseInputError(
+                f"references[{idx}] must be a ReferencePoint or a "
+                f"(row, col, target) 3-tuple"
+            )
+        if isinstance(row, bool) or not isinstance(row, int):
+            raise InvalidPhaseInputError(
+                f"references[{idx}].row must be an int (bool rejected)"
+            )
+        if isinstance(col, bool) or not isinstance(col, int):
+            raise InvalidPhaseInputError(
+                f"references[{idx}].col must be an int (bool rejected)"
+            )
+        if isinstance(target, bool) or not isinstance(target, (int, float)):
+            raise InvalidPhaseInputError(
+                f"references[{idx}].target must be a finite real number"
+            )
+        target = float(target)
+        if math.isnan(target) or math.isinf(target):
+            raise InvalidPhaseInputError(
+                f"references[{idx}].target must be finite (NaN/Infinity rejected)",
+                row=row if 0 <= row < height else None,
+                col=col if 0 <= col < width else None,
+            )
+        if not (0 <= row < height and 0 <= col < width):
+            raise InvalidPhaseInputError(
+                f"references[{idx}] pixel ({row},{col}) is outside the "
+                f"{height}x{width} grid",
+                row=max(0, min(row, height - 1)),
+                col=max(0, min(col, width - 1)),
+            )
+        if not m_grid[row][col]:
+            raise InvalidPhaseInputError(
+                f"references[{idx}] pixel ({row},{col}) is masked out "
+                f"(not a valid phase pixel)",
+                row=row,
+                col=col,
+            )
+        if (row, col) in seen:
+            raise InvalidPhaseInputError(
+                f"duplicate reference pixel ({row},{col})", row=row, col=col
+            )
+        seen.add((row, col))
+        out.append(ReferencePoint(row, col, target))
+    out.sort(key=lambda p: (p.row, p.col))
+    return out
+
+
+def _apply_alignment(result: UnwrapResult, references) -> UnwrapResult:
+    """按参考点给每个连通区确定整体整圈偏移并平移。
+
+    同区多个参考点推得的整数圈数必须一致；分数残差也必须一致到
+    UNWRAP_TOLERANCE，否则抛 ReferenceConflictError，绝不靠平滑掩盖。
+    没有参考点的区保持未对齐：offsets/unwrapped 原样保留。
+    cuts、unmet_edges 原样保留，对齐不会让它们消失。
+    """
+    refs = list(references)
+    if not refs:
+        alignment = tuple(
+            RegionAlignment(
+                anchor=rg.anchor,
+                shift=0,
+                aligned=False,
+                reference_points=(),
+                residual=0.0,
+            )
+            for rg in result.regions
+        )
+        return result._replace(alignment=alignment)
+
+    # 像素 -> 区域下标。
+    region_of: dict[tuple[int, int], int] = {}
+    for i, rg in enumerate(result.regions):
+        for p in rg.pixels:
+            region_of[p] = i
+
+    per_region: list[list[ReferencePoint]] = [[] for _ in result.regions]
+    for ref in refs:
+        per_region[region_of[(ref.row, ref.col)]].append(ref)
+
+    shifts: list[int] = [0] * len(result.regions)
+    aligned_flags: list[bool] = [False] * len(result.regions)
+    info_points: list[tuple[tuple[int, int], ...]] = [()] * len(result.regions)
+    info_resid: list[float] = [0.0] * len(result.regions)
+
+    for i, group in enumerate(per_region):
+        if not group:
+            continue
+        anchor = result.regions[i].anchor
+        # 每个参考点独立推出需要的整体平移：
+        # shift = round((target - phi_local)/(2π))，残差为扣掉整圈后的偏差。
+        derived = []
+        for ref in group:
+            phi_local = result.unwrapped[ref.row][ref.col]
+            raw = (ref.target - phi_local) / TWO_PI
+            k = _nearest_int(raw)
+            residual = ref.target - (phi_local + k * TWO_PI)
+            derived.append((ref, k, residual))
+        k0 = derived[0][1]
+        for ref, k, _res in derived[1:]:
+            if k != k0:
+                detail = ", ".join(
+                    f"({d[0].row},{d[0].col})->{d[1]:+d} turns" for d in derived
+                )
+                raise ReferenceConflictError(
+                    f"reference points in region anchored at {anchor} demand "
+                    f"different whole-turn shifts [{detail}]; the regions "
+                    f"cannot be aligned without hiding a 2*pi contradiction",
+                    anchor,
+                    [d[0] for d in derived],
+                )
+        worst_frac = max(abs(d[2]) for d in derived)
+        if worst_frac > UNWRAP_TOLERANCE:
+            detail = ", ".join(
+                f"({d[0].row},{d[0].col}) residual {d[2]:+.3e}" for d in derived
+            )
+            raise ReferenceConflictError(
+                f"reference points in region anchored at {anchor} agree on the "
+                f"whole-turn shift {k0:+d} but disagree beyond tolerance "
+                f"{UNWRAP_TOLERANCE:g} rad [{detail}]",
+                anchor,
+                [d[0] for d in derived],
+            )
+        shifts[i] = k0
+        aligned_flags[i] = True
+        info_points[i] = tuple((d[0].row, d[0].col) for d in derived)
+        info_resid[i] = worst_frac
+
+    # 平移各区：offsets 与 unwrapped 整体加 shift；cuts/unmet_edges 不动。
+    new_regions: list[Region] = []
+    for i, rg in enumerate(result.regions):
+        s = shifts[i]
+        new_regions.append(
+            Region(
+                anchor=rg.anchor,
+                baseline=rg.baseline + s,
+                pixels=rg.pixels,
+                offsets=tuple(k + s for k in rg.offsets),
+            )
+        )
+    shift_of_pixel = {
+        p: shifts[i]
+        for i, rg in enumerate(result.regions)
+        for p in rg.pixels
+    }
+    height = len(result.unwrapped)
+    width = len(result.unwrapped[0]) if height else 0
+    new_grid = tuple(
+        tuple(
+            (
+                result.unwrapped[r][c] + shift_of_pixel[(r, c)] * TWO_PI
+                if (r, c) in shift_of_pixel
+                else None
+            )
+            for c in range(width)
+        )
+        for r in range(height)
+    )
+    alignment = tuple(
+        RegionAlignment(
+            anchor=result.regions[i].anchor,
+            shift=shifts[i],
+            aligned=aligned_flags[i],
+            reference_points=info_points[i],
+            residual=info_resid[i],
+        )
+        for i in range(len(result.regions))
+    )
+    return result._replace(
+        regions=tuple(new_regions), unwrapped=new_grid, alignment=alignment
+    )
+
+
+def align_regions(result: UnwrapResult, references) -> UnwrapResult:
+    """对已完成的展开结果按参考点做整圈对齐（纯函数）。
+
+    references: None 或 ReferencePoint / (row, col, target) 三元组的序列。
+    同一连通区的多个参考点必须推出同一个整体整数圈偏移且分数残差在
+    UNWRAP_TOLERANCE 内，否则抛 ReferenceConflictError；没有参考点的区
+    保持未对齐。返回新的 UnwrapResult，cuts/unmet_edges/residues 原样保留。
+    """
+    if not isinstance(result, UnwrapResult):
+        raise InvalidPhaseInputError(
+            "result must be an UnwrapResult returned by unwrap_phase()"
+        )
+    height = len(result.unwrapped)
+    width = len(result.unwrapped[0]) if height else 0
+    m_grid = [
+        [v is not None for v in row] for row in result.unwrapped
+    ]
+    norm = _validate_references(references, height, width, m_grid)
+    return _apply_alignment(result, norm)
+
+
+def unwrap_phase(
+    phase,
+    mask,
+    *,
+    search_budget: int = DEFAULT_SEARCH_BUDGET,
+    references=None,
+) -> UnwrapResult:
     """残差切口相位展开（纯函数：不修改 phase/mask）。
 
     非法输入抛 InvalidPhaseInputError（带 row/col）；搜索预算耗尽抛
     SearchBudgetExhausted；剩余残差证明无法到达外边界抛 NoSolutionError；
     环和不是 2π 整数倍抛 UnwrappingContradictionError。
+
+    references: 可选的 ReferencePoint / (row, col, target) 三元组序列。
+    同一连通区的参考点确定该区的整体整圈偏移；同区参考点互相矛盾抛
+    ReferenceConflictError（不靠平滑掩盖）；没有参考点的区保持未对齐。
+    对齐只平移各区整圈，cuts 与 unmet_edges 原样保留。
     """
     w, m, height, width = _validate(phase, mask, search_budget)
+    norm_refs = _validate_references(references, height, width, m)
 
     residues, charges = _compute_residues(w, m, height, width)
 
@@ -516,10 +803,12 @@ def unwrap_phase(phase, mask, *, search_budget: int = DEFAULT_SEARCH_BUDGET) -> 
         for r in range(height)
     )
 
-    return UnwrapResult(
+    result = UnwrapResult(
         residues=residues,
         cuts=cut_sorted,
         regions=tuple(regions_out),
         unwrapped=grid,
         unmet_edges=tuple(unmet),
+        alignment=(),
     )
+    return _apply_alignment(result, norm_refs)

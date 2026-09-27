@@ -19,9 +19,12 @@ import phasecut
 from phasecut import (
     InvalidPhaseInputError,
     NoSolutionError,
+    ReferenceConflictError,
     SearchBudgetExhausted,
+    ReferencePoint,
     wrap_phase,
     unwrap_phase,
+    align_regions,
     TWO_PI,
 )
 
@@ -814,6 +817,197 @@ class TestContradictionContract(unittest.TestCase):
         exc = UnwrappingContradictionError(2, 3, 0.7)
         self.assertEqual((exc.row, exc.col, exc.loop_sum), (2, 3, 0.7))
         self.assertIsInstance(exc, phasecut.PhaseCutError)
+
+
+class TestReferenceAlignment(unittest.TestCase):
+    """参考点整圈对齐：独立真值核验，矛盾必须报错，不得平滑掩盖。"""
+
+    def _two_islands(self):
+        h = w = 10
+        mask = [[False] * w for _ in range(h)]
+        for r in range(0, 4):
+            for c in range(0, 4):
+                mask[r][c] = True
+        for r in range(6, 10):
+            for c in range(6, 10):
+                mask[r][c] = True
+        # 解析斜坡真值（独立给定，不用核心推导）。
+        truth = [
+            [0.31 * r - 0.17 * c + 0.6 for c in range(w)]
+            for r in range(h)
+        ]
+        g = [
+            [wrap_phase(truth[r][c]) if mask[r][c] else 0.0
+             for c in range(w)]
+            for r in range(h)
+        ]
+        return g, mask, truth
+
+    def test_aligns_two_regions_to_known_truth(self):
+        g, mask, truth = self._two_islands()
+        refs = [
+            ReferencePoint(0, 0, truth[0][0] + 3 * TWO_PI),
+            (9, 9, truth[9][9] - 2 * TWO_PI),
+        ]
+        res = unwrap_phase(g, mask, references=refs)
+        self.assertEqual(len(res.regions), 2)
+        self.assertEqual([rg.baseline for rg in res.regions], [3, -2])
+        # 每个像素：对齐后的展开值与解析真值之差恒为该区指定的整圈常数。
+        for r in range(10):
+            for c in range(10):
+                if not mask[r][c]:
+                    self.assertIsNone(res.unwrapped[r][c])
+                elif r < 4:
+                    self.assertLess(
+                        abs(res.unwrapped[r][c] - (truth[r][c] + 3 * TWO_PI)),
+                        1e-9,
+                    )
+                else:
+                    self.assertLess(
+                        abs(res.unwrapped[r][c] - (truth[r][c] - 2 * TWO_PI)),
+                        1e-9,
+                    )
+        # offsets 同步整体平移；对齐值仍等于 wrapped + 2π*offset。
+        for rg in res.regions:
+            for (r, c), k in zip(rg.pixels, rg.offsets):
+                self.assertLess(
+                    abs(res.unwrapped[r][c] - (g[r][c] + k * TWO_PI)), 1e-12
+                )
+        info = {a.anchor: a for a in res.alignment}
+        self.assertTrue(all(a.aligned for a in res.alignment))
+        self.assertEqual(info[(0, 0)].shift, 3)
+        self.assertEqual(info[(6, 6)].shift, -2)
+        self.assertEqual(info[(0, 0)].reference_points, ((0, 0),))
+        self.assertLess(info[(0, 0)].residual, 1e-12)
+
+    def test_align_regions_function_matches_keyword(self):
+        g, mask, truth = self._two_islands()
+        base = unwrap_phase(g, mask)
+        via_func = align_regions(base, [(0, 0, truth[0][0] + TWO_PI)])
+        via_kw = unwrap_phase(g, mask, references=[(0, 0, truth[0][0] + TWO_PI)])
+        self.assertEqual(via_func, via_kw)
+        # 纯函数：不改动传入结果。
+        self.assertEqual(base.regions[0].baseline, 0)
+        self.assertFalse(base.alignment[0].aligned)
+
+    def test_unreferenced_region_stays_local(self):
+        g, mask, truth = self._two_islands()
+        base = unwrap_phase(g, mask)
+        res = unwrap_phase(g, mask, references=[(0, 0, truth[0][0] + TWO_PI)])
+        # 被参考的区平移；未参考的区 baseline/网格与原始局部结果完全一致。
+        self.assertEqual(res.regions[0].baseline, 1)
+        self.assertEqual(res.regions[1].baseline, 0)
+        self.assertTrue(res.alignment[0].aligned)
+        self.assertFalse(res.alignment[1].aligned)
+        self.assertEqual(res.alignment[1].reference_points, ())
+        for (r, c) in res.regions[1].pixels:
+            self.assertEqual(
+                res.unwrapped[r][c], base.unwrapped[r][c]
+            )
+        self.assertEqual(res.regions[1].offsets, base.regions[1].offsets)
+
+    def test_multiple_consistent_references_in_one_region(self):
+        g, mask, truth = self._two_islands()
+        res = unwrap_phase(
+            g,
+            mask,
+            references=[
+                (0, 0, truth[0][0] + 2 * TWO_PI),
+                (3, 3, truth[3][3] + 2 * TWO_PI),
+            ],
+        )
+        self.assertEqual(res.regions[0].baseline, 2)
+        info = res.alignment[0]
+        self.assertEqual(
+            info.reference_points, ((0, 0), (3, 3))
+        )
+
+    def test_conflicting_whole_turns_raises(self):
+        g, mask, truth = self._two_islands()
+        with self.assertRaises(ReferenceConflictError) as cm:
+            unwrap_phase(
+                g,
+                mask,
+                references=[
+                    (0, 0, truth[0][0]),
+                    (3, 3, truth[3][3] + TWO_PI),
+                ],
+            )
+        self.assertEqual(cm.exception.anchor, (0, 0))
+        self.assertEqual(
+            {(p.row, p.col) for p in cm.exception.points},
+            {(0, 0), (3, 3)},
+        )
+
+    def test_conflicting_fractional_targets_raises(self):
+        g, mask, truth = self._two_islands()
+        with self.assertRaises(ReferenceConflictError) as cm:
+            unwrap_phase(
+                g,
+                mask,
+                references=[
+                    (0, 0, truth[0][0]),
+                    (3, 3, truth[3][3] + 0.5),  # 差 0.5 rad，非整圈
+                ],
+            )
+        self.assertEqual(cm.exception.anchor, (0, 0))
+
+    def test_cuts_and_unmet_edges_survive_alignment(self):
+        # 绕洞卷绕数据：对齐前后 cuts/unmet_edges 必须逐字节一致。
+        h = w = 9
+        mask = [[True] * w for _ in range(h)]
+        mask[4][4] = False
+        g = [
+            [wrap_phase(math.atan2(r - 4.5, c - 4.5)) for c in range(w)]
+            for r in range(h)
+        ]
+        base = unwrap_phase(g, mask)
+        self.assertGreaterEqual(len(base.unmet_edges), 1)
+        aligned = align_regions(
+            base, [(0, 0, base.unwrapped[0][0] + 2 * TWO_PI)]
+        )
+        self.assertEqual(aligned.cuts, base.cuts)
+        self.assertEqual(aligned.unmet_edges, base.unmet_edges)
+        self.assertEqual(aligned.residues, base.residues)
+        # 被平移的区恰好整体抬高 2π；矛盾边本身仍在报告里。
+        for rg in aligned.regions:
+            for (r, c) in rg.pixels:
+                self.assertLess(
+                    abs(aligned.unwrapped[r][c]
+                        - (base.unwrapped[r][c] + 2 * TWO_PI)),
+                    1e-12,
+                )
+
+    def test_reference_input_validation(self):
+        g, mask, _truth = self._two_islands()
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, mask, references=(0, 0, 1.0))  # 非序列元素
+        with self.assertRaises(InvalidPhaseInputError) as cm:
+            unwrap_phase(g, mask, references=[(4, 4, 1.0)])  # 无效像素
+        self.assertEqual((cm.exception.row, cm.exception.col), (4, 4))
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, mask, references=[(10, 0, 1.0)])  # 越界
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, mask, references=[(0, 0, float("nan"))])
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, mask, references=[(0, 0, float("inf"))])
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, mask, references=[(True, 0, 1.0)])
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(g, mask, references=[(0, 0, True)])
+        with self.assertRaises(InvalidPhaseInputError):
+            unwrap_phase(
+                g, mask, references=[(0, 0, 1.0), (0, 0, 2.0)]
+            )  # 重复像素
+
+    def test_no_references_default_is_unaligned(self):
+        g, mask, _truth = self._two_islands()
+        res = unwrap_phase(g, mask)
+        self.assertEqual(len(res.alignment), 2)
+        for info in res.alignment:
+            self.assertFalse(info.aligned)
+            self.assertEqual(info.shift, 0)
+            self.assertEqual(info.residual, 0.0)
 
 
 if __name__ == "__main__":

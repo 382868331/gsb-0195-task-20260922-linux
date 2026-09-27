@@ -16,8 +16,11 @@ import time
 from phasecut import (
     InvalidPhaseInputError,
     NoSolutionError,
+    ReferenceConflictError,
     SearchBudgetExhausted,
+    ReferencePoint,
     TWO_PI,
+    align_regions,
     unwrap_phase,
     wrap_phase,
 )
@@ -218,6 +221,62 @@ def main():
     ok = unwrap_phase(g2, mask2, search_budget=1_000_000)
     print(f"  同一输入预算充足时正常完成：残差 {len(ok.residues)} 个，"
           f"未满足边 {len(ok.unmet_edges)} 条 —— 耗尽是“没算完”，不是无解。")
+
+    # --- 3d. 实际触发：参考点整圈对齐（正常结果 + 冲突拒绝） -------------
+    section("3d. 参考点整圈对齐：两个 mask 孤岛对齐到已知真值")
+    h = w = 10
+    islands = [[False] * w for _ in range(h)]
+    for r in range(0, 4):
+        for c in range(0, 4):
+            islands[r][c] = True
+    for r in range(6, 10):
+        for c in range(6, 10):
+            islands[r][c] = True
+    truth = [
+        [0.31 * r - 0.17 * c + 0.6 for c in range(w)] for r in range(h)
+    ]
+    g3 = [
+        [wrap_phase(truth[r][c]) if islands[r][c] else 0.0
+         for c in range(w)]
+        for r in range(h)
+    ]
+    base3 = unwrap_phase(g3, islands)
+    print(f"  对齐前：{len(base3.regions)} 个连通区，锚点 "
+          f"{[rg.anchor for rg in base3.regions]}，"
+          f"baseline {[rg.baseline for rg in base3.regions]}")
+    aligned = unwrap_phase(
+        g3,
+        islands,
+        references=[
+            ReferencePoint(0, 0, truth[0][0] + 3 * TWO_PI),
+            (9, 9, truth[9][9] - 2 * TWO_PI),
+        ],
+    )
+    print(f"  对齐后：baseline {[rg.baseline for rg in aligned.regions]} "
+          f"（整体平移 +3 / -2 整圈）")
+    err1 = aligned.unwrapped[3][3] - (truth[3][3] + 3 * TWO_PI)
+    err2 = aligned.unwrapped[6][6] - (truth[6][6] - 2 * TWO_PI)
+    print(f"  区内抽查偏差: (3,3) {err1:+.3e} rad, (6,6) {err2:+.3e} rad")
+    print(f"  切口 {len(aligned.cuts)} 条、未满足边 {len(aligned.unmet_edges)} "
+          f"条 —— 对齐只整圈平移，不让任何报告消失")
+    # 只给一个区参考点：另一个区保持未对齐的局部结果。
+    partial = unwrap_phase(
+        g3, islands, references=[(0, 0, truth[0][0] + TWO_PI)]
+    )
+    print(f"  仅参考一个区: 对齐标志 {[a.aligned for a in partial.alignment]}，"
+          f"未参考区 baseline 仍为 {partial.regions[1].baseline}")
+    # 同区参考点互相矛盾（差一整圈）：必须指出冲突，不平滑掩盖。
+    try:
+        align_regions(
+            base3,
+            [
+                (0, 0, base3.unwrapped[0][0]),
+                (3, 3, base3.unwrapped[3][3] + TWO_PI),
+            ],
+        )
+    except ReferenceConflictError as exc:
+        print(f"  矛盾参考点实际捕获 {type(exc).__name__}（锚点 {exc.anchor}）")
+        print(f"    {exc}")
 
     elapsed = time.perf_counter() - t0
     print("\n" + "-" * 68)
